@@ -1,0 +1,1066 @@
+---
+title: "EXNAT_4_TMS Preprocessing"
+author: "Sandra Martin"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    code-fold: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r file setup, echo = FALSE}
+rm(list = ls()) # clear environment
+knitr::opts_chunk$set() # set default options for all code blocks in this document
+options(scipen = 999) # don't use scientific notation for very large or small numbers
+n.cores <- max(1, parallel::detectCores() %/% 2, na.rm = T) # Use half of the available cores
+```
+
+# Load packages
+```{r packages, echo = FALSE, message = FALSE, warning = TRUE}
+# Create a list with needed libraries
+pkgs <- c("here", # for working with relative paths
+          "ggplot2", # for plots
+          "patchwork", # also for plots
+          "dplyr", # for replacing multiple values in vector with different values
+          "tidyverse", # for aggregating
+          "psycho", # for computing d-prime values
+          "devtools") # for getting packages from github
+
+
+# Load each listed library, check if it's already installed
+# and install if necessary
+for (pkg in pkgs){
+  if(!require(pkg, character.only = TRUE)){
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+# install package with lists of stop words from github
+devtools::install_github("quanteda/stopwords")
+library(stopwords)
+
+today <- Sys.Date()
+today <- format(today, format="%y%m%d")
+```
+
+# Load d-prime function from different R script:
+```{r source d-prime function, echo = FALSE}
+source(here::here("get_dprime.R")) # get script
+
+# creating a function for std.error
+std.error <- function(x, na.rm = TRUE){sd(x, na.rm = TRUE)/sqrt(length(x[!is.na(x)]))}
+```
+
+# Set path to datasets
+```{r path setup}
+path_data_folder <- here::here("Raw_data/")
+```
+
+# Read in data & do preprocessing on participant-level
+In this chunk, we read in every dataset individually, compute reading times, reading speed, d-primes, comprehension question performance, and so on, add a few information on the words we used (e.g. surprisal scores on our 4 time scales, word frequencies, word lengths, punctuation,...), 
+```{r Read in data, message=FALSE}
+# Get list of all .csv files in the data folder
+file_list <- list.files(path = path_data_folder, pattern = "^sub-.*\\.csv$")
+
+# Placeholders df for demographics, questions & text data
+df_all_data_raw     <- data.frame()
+df_comprehension_Qs <- data.frame()
+
+# Loop files in my file list aka directory
+for (i in 1:length(file_list)) {
+
+  # PREPARE FILE FOR PREPROCESSING
+  # Read in current file
+  subj_df <- read.csv(paste(path_data_folder, file_list[i],sep = ""), sep = ",")
+
+  # If the df is separated by a semicolon instead of a comma, we only get
+  # one messed-up column. In this case, use semicolon as separator for csv:
+  if (ncol(subj_df) == 1) {
+   subj_df <- read.csv(paste(path_data_folder, file_list[i],sep = ""), sep = ";")
+  }
+  
+  id <- subj_df$participant[1]
+  
+  # print message
+  message(paste(i, " - Reading in file ", file_list[i], ", participant ID: ", id, sep = ""))
+
+  # add column with info on whether participant should be excluded
+  excl <- FALSE
+  
+  # rename block_kind column
+  subj_df <- subj_df %>% 
+    rename(nback_level = n.back_level)
+
+  # GET RAW TEXT & N-BACK DATA
+
+  # get words & information on the text from data
+  subj_df <- subj_df[, c("colour", "global_onset_time", "target", "button_pressed", "nback_response", "nback_RT", "RT", "text_nr", "trial_nr", "block_nr_exp", "block_name", "nback_level", "word", "nontarget_triggers_sent_this_condition", "target_triggers_sent_this_condition", "total_triggers_sent_this_condition", "minimum_triggers_this_condition", "maximum_triggers_this_block", "trigger_time", "question", "chosen_ans", "ans_correct", "participant", "session", "date")]
+  
+  # remove weird empty rows in df, most likely written by Psychopy
+  subj_df <- subset(subj_df, !is.na(global_onset_time))
+
+  
+  ### ADD NUMBERED BLOCK NAMES ####
+
+  # # We have each main block twice, but I would like to exclude outliers by block and not by condition.
+  # # Reason: Reading times in second block might be slightly different than in first block, so don't mix them up.
+  # 
+  # Separate out sub 7, session 2 because there are two logfiles and we want to fix the block order so they are numbered sequentially
+  if (file_list[i] == "sub-07_ses-02_2025-06-04_10h57.19.947.csv"){
+    change_df <- subj_df %>%
+      filter(!is.na(trial_nr)) %>%
+      group_by(block_nr_exp, block_name) %>%
+      count() %>%
+      ungroup() %>%
+      group_by(block_name) %>%
+      mutate(Index = row_number() + 1) %>% 
+      mutate(block_names_numbered = paste(block_name, Index, sep = "_")) %>%
+      ungroup() %>% 
+      mutate(block_nr_exp_new = row_number() + 4) %>% 
+      select(-c(Index, n))
+      
+      subj_df <- full_join(subj_df, change_df)
+      
+      subj_df <- subj_df %>% 
+        mutate(block_nr_exp = block_nr_exp_new)
+  } else {
+    change_df <- subj_df %>%
+      filter(!is.na(trial_nr)) %>%
+      group_by(block_nr_exp, block_name) %>%
+      count() %>%
+      ungroup() %>%
+      group_by(block_name) %>%
+      mutate(Index=1:n()) %>%
+      mutate(block_names_numbered = paste(block_name, Index, sep = "_")) %>%
+      select(-c(Index, n))
+      
+      subj_df <- full_join(subj_df, change_df)
+  }
+  
+  #subj_df <- full_join(subj_df, change_df)
+
+  # GET ADDITIONAL INFORMATION ON THE TEXTS:
+
+  ### PUNCTUATION ####
+
+  # Edit the texts a bit. Currently, we have words & punctuation
+  # mixed up. Would be nice if we had one word column
+  # and some others with info on punctuation.
+
+  punctuation <- c(rep("", times = length(subj_df$participant)))
+
+  # get all .
+  punctuation[grep("[.]", subj_df$word)] <- "point"
+  # get all ?
+  punctuation[grep("[?]", subj_df$word)] <- "question_mark"
+  # get all !
+  punctuation[grep("[!]", subj_df$word)] <- "exclamation_mark"
+  # get all ,
+  punctuation[grep("[,]", subj_df$word)] <- "comma"
+  # get all ;
+  punctuation[grep("[;]", subj_df$word)] <- "semicolon"
+  # get all :
+  punctuation[grep("[:]", subj_df$word)] <- "colon"
+
+  # get all "
+  # This is tricky for various reasons:
+
+  # 1. there could be quotes directly after or
+  # before a point for example
+
+  # Idea: Separate column for quotes
+  quotes <- c(rep("", times = length(subj_df$participant)))
+
+  # 2. I want to differentiate between opening and closing quotes,
+  # but they look the same.
+
+  # Idea: make them all "opening quotes" and change every second one to
+  # "closing_quote". This should do the trick.
+  quotes[grep("\"", subj_df$word)] <- "opening_quote"
+  opening <- TRUE
+
+  # loop list of quotes
+  for (x in 1:length(quotes)){
+    # get current value in vector "quotes" & current word
+    curr_val  <- quotes[x]
+    curr_word <- subj_df$word[x]
+
+    if (curr_val == "opening_quote" & # if the current value is not empty
+        opening == TRUE & # and we set "opening" to TRUE
+        grepl("\"[A-Za-z0-9]+\"", curr_word) == FALSE){ # and there are not 2 quotes around the word
+
+      # leave it as is, next quote is the closing one
+      opening <- FALSE
+
+      # if we have a quote, but it has to be a closing one, change it accordingly
+    } else if (curr_val == "opening_quote" &
+               opening == FALSE &
+               grepl("\"[A-Za-z0-9]+\"", curr_word) == FALSE){
+      # change value to closing quote
+      quotes[x] <- "closing_quote"
+      # next quote is the opening one
+      opening <- TRUE
+      # if it's a quote around a single word, mark as "both"
+    } else if (curr_val == "opening_quote" &
+               grepl("\"[A-Za-z0-9]+\"", curr_word) == TRUE){
+      # change value to both
+      quotes[x] <- "both"
+    }
+  }
+
+  # remove all punctuation
+  word_single <- gsub('[[:punct:] ]+',' ', subj_df$word)
+  # "trim" away spaces before and after words
+  word_single <- trimws(word_single, which = c("left"))
+  word_single <- trimws(word_single, which = c("right"))
+  # put dashes into spaces between words (words like "ice-cream" for example)
+  word_single <- gsub(" ", "-", word_single, fixed = TRUE)
+
+  # get word length for single words
+  word_length_single <- nchar(word_single)
+
+
+  ### N-BACK RESPONSES ####
+
+  # check if we had an n-back reaction while the word was shown
+  # create vector with only FALSEs
+  reaction <- c(rep(FALSE, times = length(subj_df$participant)))
+  # check where in subj_df we have responses (hit or false alarm) and change value in reaction vector to TRUE at that index
+  reaction[which(subj_df$nback_response == "hit" | subj_df$nback_response == "false alarm")] <- TRUE
+
+  # APPEND NEW COLUMNS
+  # append punctuation and quotes column, column with words without punctuation
+  # column with length of each the single words and reaction column as
+  # additional columns to subj_df:
+  subj_df <- data.frame(cbind(subj_df, word_single, punctuation,
+                              quotes, word_length_single, reaction))
+
+  ### STOP WORDS ####
+
+  # Now also get previous reaction and stop words.
+  # First, append empty columns to df:
+  subj_df[, c("previous_reaction", "previous_duration", "stop_word")] <- ""
+
+  # get list of German stop_words
+  stop_words <- stopwords("de", source = "snowball")
+  # snowball = stopwords list based on the Snowball stemmer's word lists.
+  # --> https://snowballstem.org/texts/introduction.html
+
+  # now loop rows and gradually fill in the empty columns.
+  for (idx in 1:length(subj_df$participant)){
+    # if it's the first trial of a new block, go to next iteration
+    # because in this case we don't have previous data.
+    # Also skip the following part if it's a block without text.
+    if (subj_df$trial_nr[idx] > 1 && !is.na(subj_df$trial_nr[idx])){
+      # fill in the missing data by getting the values from the previous trial:
+      subj_df$previous_duration[idx]    <- subj_df$RT[idx-1]
+      subj_df$previous_reaction[idx]    <- subj_df$reaction[idx-1]
+    }
+
+    if (subj_df$word_single[idx] %in% stop_words){
+      # check if current word is a stop word or not
+      subj_df$stop_word[idx] <- TRUE 
+      }
+    else {
+      subj_df$stop_word[idx] <- FALSE
+    }
+  }
+  
+  ### WORD FREQUENCIES, SURPRISAL & ENTROPY SCORES ####
+
+  # Include word frequencies & surprisal scores for each word
+
+  # append "empty" word frequency & surprisal score columns to df
+  # to do so, create a vector of column names
+  col_names <- c("word_frequency", "zipf_frequency", "surprisal_2", "entropy_2")
+  # then add "empty" columns to data frame subj_df
+  subj_df[, col_names] <- 0
+
+  # get word frequency & surprisal scores for each word
+  # load word freq df
+  word_freqs_df = read.csv(here::here("word_frequencies/EXNAT_4_TMS_word_freqs.csv"), sep = ";", header = TRUE)
+  # Explanation: We compute the word frequencies using another
+  #              script which is called "calculate_word_frequencies.py".
+  #              You can find it in the Analysis folder.
+  #              --> word frequencies were taken from this python package:
+  #              Speer, R., Chin, J., Lin, A., Jewett, S., & Nathan, L. (2018, October 3).
+  #              LuminosoInsight/wordfreq: v3.1.1 Zenodo. https://doi.org/10.5281/zenodo.1443582
+
+
+  # Load surprisal scores
+  surprisal_df = read.csv(here::here("surprisal_scores/vanilla_2words_surprisal_entropy_48Texts_11_2025.csv"), sep = ",", header = TRUE)
+
+  # Explanation: I computed the scores in Python using a German GPT-2 model. For each text you can select a context chunk of x words (e.g. 5 words)
+  #              and predict the next word. For each possible continuation of your context, you get probabilities.
+  #              If you get the probability for the actual word and compute the negative log of it, you have the surprisal score
+  #              for your word on time scale x (e.g. 5 words = TS 5). The time scales are all highly correlated, which might be due to the fact that each
+  #              time scale also includes context information from all lower timescales, so it's like a Russian doll situation.
+  #              To deal with this problem, we masked all words that were already processed in lower time scales,
+  #              so each time scale only uses the "new" parts of the input chunk.
+
+
+  # loop individual texts
+  for (curr_text_nr in unique(subj_df$text_nr)){
+
+    # in some blocks we don't have texts, so skip those
+    # CAVE: currently also skipping text 10 because I still need to calculate values for this text
+    if (curr_text_nr == ""){
+      next
+      # if it's a text block, though, assign word frequencies from csv
+    } else {
+      #print(curr_text_nr) # uncomment this if you'd like to show the texts each participant read
+
+      # get word frequencies for current text nr
+      curr_word_freqs <- subset(word_freqs_df, text_nr == curr_text_nr)
+      
+      # find out where in the subj_df text the current text nr is located
+      curr_row <- which(subj_df$text_nr == curr_text_nr & subj_df$question == "")
+      
+      # find out where in the subj_df text the text is located and add the word frequencies there
+      subj_df[curr_row, c("word_frequency", "zipf_frequency")]  <- curr_word_freqs[c("frequency", "zipf_frequency")]
+
+      # Do the same for the surprisal scores.
+      curr_surprisals <- subset(surprisal_df, text_nr == curr_text_nr)
+
+      # find out where in the subj_df text the current text nr is located
+      curr_row <- which(subj_df$text_nr == curr_text_nr & subj_df$question == "")
+
+      # add the surprisal scores (untransformed & orthogonalized scores) there
+      subj_df[curr_row, c("surprisal_2", "entropy_2")]  <- curr_surprisals[c("surprisal_2_words_context", "entropy_2_words_context")]
+      
+    }# END if
+  }# END loop texts
+
+  
+  ### GET SURPRISAL SCORES OF PREVIOUS WORD ####
+  # --> basically do the same again as before, but add surprisal scores for current for to row of next word.
+
+  # append "empty" word frequency & surprisal score columns to df
+  # to do so, create a vector of column names
+  col_names <- c("zipf_frequency_previous_word", "previous_surprisal_2", "previous_entropy_2")
+  # then add "empty" columns to data frame subj_df
+  subj_df[, col_names] <- 0
+
+  # loop individual texts
+  for (curr_text_nr in unique(subj_df$text_nr)){
+
+    # in some blocks we don't have texts, so skip those
+    if (curr_text_nr == ""){
+      next
+      # if it's a text block, though, assign word frequencies from csv
+    } else {
+      print(curr_text_nr) # uncomment this if you'd like to show the texts each participant read
+
+      # get word frequencies for current text nr
+      curr_word_freqs <- subset(word_freqs_df, text_nr == curr_text_nr)$zipf_frequency
+
+      # now this is where we do it differently than before: Remove the last value and add 1 NA
+      # at idx = 1 of the vector, so the values are moved by 1 position.
+      curr_word_freqs <- c(NA, curr_word_freqs[-length(curr_word_freqs)])
+
+      # find out where in the subj_df text the text is located and add the word frequencies there
+      subj_df[which(subj_df$text_nr == curr_text_nr & subj_df$question == ""),]$zipf_frequency_previous_word <- curr_word_freqs
+
+      # Do the same for the surprisal scores:
+      curr_surprisals <- subset(surprisal_df, text_nr == curr_text_nr)[ , c("surprisal_2_words_context", "entropy_2_words_context")]
+
+      # add 1 NA to the start of the vectors, remove last value in each
+      curr_surprisals <- rbind(c(NA, NA), curr_surprisals[-nrow(curr_surprisals), ])
+
+      # find out where in the subj_df text the current text nr is located
+      curr_row <- which(subj_df$text_nr == curr_text_nr & subj_df$question == "")
+
+      # add the surprisal scores (untransformed & orthogonalized scores) there
+      subj_df[curr_row, c("previous_surprisal_2", "previous_entropy_2")] <- curr_surprisals
+
+    }# END if
+  }# END loop texts
+  
+  ### CHANGE ORDER OF DATAFRAME ####
+  # Move around the columns a bit:
+  col_order <- c("participant", "session", "nback_level", "block_nr_exp", "block_name", "block_names_numbered",
+                 "trial_nr", "text_nr", "word", "global_onset_time", "RT",
+                 "colour", "target", "button_pressed", "nback_response", "nback_RT", "reaction",
+                 "word_single", "word_length_single", "word_frequency", "zipf_frequency",
+                 "surprisal_2", "entropy_2", "previous_surprisal_2", "previous_entropy_2", "zipf_frequency_previous_word", 
+                 "previous_duration", "previous_reaction",
+                 "nontarget_triggers_sent_this_condition",
+                 "target_triggers_sent_this_condition", "total_triggers_sent_this_condition", "minimum_triggers_this_condition", "maximum_triggers_this_block", "trigger_time", "question", "chosen_ans", "ans_correct", "stop_word", "punctuation", "quotes", "date")
+
+  subj_df <- subj_df[, col_order]
+  
+  ### GET PERFORMANCE MEASURES ####
+
+  #### COMPREHENSION QUESTION PERFORMANCE ####
+  
+  # get question data:
+  Q_df <- subset(subj_df, question != "")[,c("question", "chosen_ans", "ans_correct", "text_nr", "block_name", "participant")]
+
+  Q_df$ans_correct <- as.logical(Q_df$ans_correct)
+  
+  # calculate accuracy per text
+  Q_df <- Q_df %>% 
+   group_by(text_nr) %>% 
+    mutate(question_acc = sum(ans_correct[ans_correct == TRUE])/3)
+  
+  Q_subset <- Q_df %>% 
+    select(c(text_nr, question_acc)) %>% 
+    distinct
+
+  # append Q_subset to bigger df for all participants
+  df_comprehension_Qs <- as.data.frame(rbind(df_comprehension_Qs, Q_df))
+  
+  # append overall accuracy per text to subject df
+  subj_df <- full_join(subj_df, Q_subset) %>% 
+    select(-c(question, chosen_ans, ans_correct)) %>% 
+    filter(!is.na(RT))
+
+
+  ### N-BACK PERFORMANCE ####
+
+  # set all durations in n-back trials without response to NA
+  subj_df[which(subj_df$reaction == F), ]$nback_RT <- NA
+
+  # create vector of n-back blocks in experiment
+  nback_block_names <- subj_df %>% 
+    filter(str_detect(nback_level, "^1") | str_detect(nback_level, "^2")) %>% 
+    distinct(block_nr_exp) %>% 
+    pull(block_nr_exp)
+
+  # append empty d-prime column to df:
+  subj_df$dprime <- c(rep(NA, times = length(subj_df$word)))
+
+  # loop block names:
+  for (nback_block in nback_block_names){
+
+    # get data for current block
+    curr_block <- subset(subj_df, block_nr_exp == nback_block)
+
+    # remove trials where the RT was way too fast
+    # (= participant reacted by accident)
+    curr_block <- subset(curr_block, (nback_RT >= 100 | is.na(nback_RT)))
+
+    # if there are still some trials left (let's say at least 5), compute d-prime
+    if (length(curr_block$participant) > 5){
+        # compute d-prime & add to bigger df
+        d_prime <- get_dprime(curr_block$nback_response)
+        subj_df$dprime[subj_df$block_nr_exp == nback_block] <- d_prime
+    } # END if loop - check if there are still enough trials left
+  }# END loop - compute d-primes
+  
+    ### MARK PARTICIPANTS/BLOCKS FOR EXCLUSION:
+
+  # append "empty" exclude trial / exclude participant columns to df
+  subj_df$excl_trial       <- FALSE
+
+  ### EXCLUDE SINGLE BLOCKS BASED ON COMPREHENSION QUESTION PERFORMANCE: ####
+  
+  # Idea: only exclude on block level, don't exclude full datasets because they messed up in 1 condition or so.
+  # To identify these blocks, we look for a question accuracy of 0
+
+  #subj_df$excl_trial[subj_df$question_acc == 0] <- TRUE
+  #message(paste("excluded", length(subj_df[which(subj_df$question_acc == 0), "excl_trial"]), "trials because accuracy was 0%", sep = " "))
+  
+  ### EXCLUDE SINGLE BLOCKS BASED ON N-BACK TASK PERFORMANCE: ####
+  
+  # --> exclude all blocks with d-primes == 0.
+  
+ # message(paste("excluded", length(subj_df[which(subj_df$dprime == 0), "excl_trial"]), "trials because d-prime was 0", sep = " "))
+  #subj_df[which(subj_df$dprime == 0), "excl_trial"] <- TRUE
+
+  # append subj_df chunk to df_text_data where we collect the data of all participants we want to keep
+  df_all_data_raw <- as.data.frame(rbind(df_all_data_raw, subj_df))
+
+  message("------------------------")
+
+}# END READ IN DATASETS
+
+# exclude all trials that we marked for exclusion:
+#df_all_data <- subset(df_all_data, excl_trial == FALSE)
+
+
+# clean up!
+#rm(list=ls()[! ls() %in% c("df_all_data", "df_comprehension_Qs", 
+#                           "apatheme", "cols_reading", 
+#                           "palet_dprimes", "palet_dprimes_lines", 
+#                           "palet_lab_online", "palet9", "today")])
+
+saveRDS(df_comprehension_Qs, file = here::here("RData/df_comprehension_questions.rds"))
+```
+
+# Add info on stimulation type and session
+```{r add demographic info}
+df_participants_info <- read.table(here::here("EXNAT_4_TMS_participants.txt"), header = TRUE, sep = "\t")
+df_all_data_raw$participant <- str_pad(df_all_data_raw$participant, 2, pad = "0")
+df_participants_info$ID <- gsub("sub-","", df_participants_info$ID)
+df_participants_info <- df_participants_info %>% 
+  rename(participant = ID)
+
+df_all_data_raw <- full_join(df_all_data_raw, df_participants_info)
+# create a new column with stim type
+df_all_data_raw <- df_all_data_raw %>% 
+  mutate(stim_type = case_when(session == 1 & (Stim_Order == "offline,offline_online,sham" | Stim_Order == "offline,sham,offline_online") ~ "offline",
+                               session == 1 & (Stim_Order == "sham,offline_online,offline" | Stim_Order == "sham,offline,offline_online") ~ "sham",
+                               session == 1 & (Stim_Order == "offline_online,sham,offline" | Stim_Order == "offline_online,offline,sham") ~ "offline_online",
+                               session == 2 & (Stim_Order == "offline,offline_online,sham" | Stim_Order == "sham,offline_online,offline") ~ "offline_online",
+                               session == 2 & (Stim_Order == "offline_online,offline,sham" | Stim_Order == "sham,offline,offline_online") ~ "offline",
+                               session == 2 & (Stim_Order == "offline_online,sham,offline" | Stim_Order == "offline,sham,offline_online") ~ "sham",
+                               session == 3 & (Stim_Order == "offline,offline_online,sham" | Stim_Order == "offline_online,offline,sham") ~ "sham",
+                               session == 3 & (Stim_Order == "sham,offline_online,offline" | Stim_Order == "offline_online,sham,offline") ~ "offline",
+                               session == 3 & (Stim_Order == "offline,sham,offline_online" | Stim_Order == "sham,offline,offline_online") ~ "offline_online",
+                             TRUE ~ NA))
+
+# calculate mean d-prime from 1-back and 2-back single task main blocks from the sham session as a working memory measure for each participant
+df_all_data_raw <- df_all_data_raw %>%
+  group_by(participant) %>%
+  mutate(mean_dprime_singletasks = mean(c(
+        unique(dprime[stim_type == "sham" & block_name == "1back_single_main_click"]),
+        unique(dprime[stim_type == "sham" & block_name == "2back_single_main_click"]))))
+
+# reorder df
+df_all_data_raw <- df_all_data_raw[,c(1,42,43,2,74,46:50,3:41,44,45,51:73,75)]
+
+# plot some descriptives on number of TMS trains given ----
+df_all_data_raw_subset <- subset(df_all_data_raw, stim_type != "offline")
+
+df_all_data_raw_subset$block_name <- factor(df_all_data_raw_subset$block_name, levels = c("Reading_Baseline_main_click", "2back_dual_main_click", "1back_single_main_click", "2back_single_main_click"))
+
+df_subset <- df_all_data_raw %>%
+  group_by(participant, stim_type, block_name, target) %>% 
+  summarize(max_trains = max(total_triggers_sent_this_condition))
+
+label_map <- c(
+  "Reading_Baseline_main_click" = "Reading",
+  "2back_dual_main_click" = "Dual task",
+  "1back_single_main_click" = "1-back",
+  "2back_single_main_click" = "2-back"
+)
+
+df_subset$block_name_short <- label_map[df_subset$block_name]
+
+(plot_max_trains <- ggplot(df_subset, aes(x = block_name_short, y = max_trains)) +
+    #geom_violinhalf(position = position_nudge(x = 0.05), width = 1.2) +
+    geom_boxplot(width = 0.4) +
+    stat_summary(fun = mean, geom = "text", aes(label = sprintf("M=%.1f", after_stat(y))), hjust = 1.4, size = 2.5, color = "blue", fontface = "bold") +
+    stat_summary(fun = min, geom = "text", aes(label = sprintf("min=%.0f", after_stat(y))), vjust = 1.5, size = 2, color = "grey30") +
+    stat_summary(fun = max, geom = "text", aes(label = sprintf("max=%.0f", after_stat(y))), vjust = -0.5, size = 2, color = "grey30") +
+    scale_x_discrete(expand = expansion(add = c(0.8, 0.5))) +  
+    facet_grid(~stim_type) +
+    theme_bw() +
+    theme(#legend.position = "none",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         strip.background = element_blank(),
+         plot.title = element_text(size = 10),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 8),
+         axis.title.x = element_blank(),
+         axis.text.x = element_text(angle = 45, hjust = 1),
+         axis.text.x.bottom = element_text(size = 8))
+)
+
+(plot_max_trains_trigger <- ggplot(df_subset[df_subset$block_name != "Reading_Baseline_main_click",], aes(x = block_name_short, y = max_trains, color = target, fill = target)) +
+    #geom_violinhalf(position = position_dodge(width = 0.6), width = 1.2) +
+    geom_boxplot(position = position_dodge(width = 0.9), width = 0.4, fill = NA) +
+    stat_summary(fun = mean, geom = "text", aes(label = sprintf("M=%.1f", after_stat(y))), vjust = -0.5, size = 2.5, color = "blue", fontface = "bold", position = position_dodge(width = 0.9),) +
+    stat_summary(fun = min, geom = "text", aes(label = sprintf("min=%.0f", after_stat(y))), vjust = 1.5, size = 2, color = "grey30", position = position_dodge(width = 0.9),) +
+    stat_summary(fun = max, geom = "text", aes(label = sprintf("max=%.0f", after_stat(y))), vjust = -0.5, size = 2, color = "grey30", position = position_dodge(width = 0.9),) +
+    facet_grid(~stim_type) +
+    theme_bw() +
+    theme(legend.position = "bottom",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         strip.background = element_blank(),
+         plot.title = element_text(size = 10),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 8),
+         axis.title.x = element_blank(),
+         axis.text.x = element_text(angle = 45, hjust = 1),
+         axis.text.x.bottom = element_text(size = 8))
+)
+
+(plot_online_TMS_trains <- plot_max_trains / plot_max_trains_trigger)
+ggsave(plot_online_TMS_trains, file = here::here("Plots/plot_online_TMS_trains.png"), width = 155, height = 200, units = "mm")
+
+m_TMS_trains <- lmerTest::lmer(max_trains ~
+                                    stim_type +
+                                 block_name +
+                                    (1|participant),
+                                  data = df_subset, 
+                                  REML = TRUE)
+summary(m_TMS_trains)
+```
+
+# Neuropsychological tests
+```{r}
+# Check for possible sum score for neuropsychological tests and add to large df
+NP_df <- df_participants_info %>% 
+  select(participant, TMT_A, TMT_B, DSST, RS)
+
+dprime_df <- df_all_data_raw %>% 
+  select(participant, mean_dprime_singletasks) %>% 
+  distinct()
+
+NP_df <- full_join(NP_df, dprime_df)
+
+# Calculate correlation matrix
+cor_mat <- cor(NP_df[,2:6])
+
+# Visualize correlation heatmap
+library(reshape2)
+melted_cor <- melt(cor_mat)
+ggplot(melted_cor, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2()
+
+# Calculate Cronbach's alpha
+library(psych)
+NP_df$TMT_A_inv <- NP_df$TMT_A*(-1)
+NP_df$TMT_B_inv <- NP_df$TMT_B*(-1)
+psych::alpha(NP_df[,c(4,5,7,8)])
+
+# --> we can summarize TMT and DSST but should keep RS separate
+# standardize selected columns
+scores_z <- scale(NP_df[, c("DSST", "TMT_A_inv", "TMT_B_inv")])
+NP_df$executive_sum <- rowMeans(scores_z, na.rm = TRUE)
+
+NP_df <- NP_df %>% 
+  select(participant, executive_sum)
+
+# Merge with large df
+df_all_data_raw <- full_join(df_all_data_raw, NP_df)
+```
+
+# Questionnaire Side effects
+```{r add side effects quest}
+df_sideEffects <- read.table(here::here("Quest_Side_Effects_cleaned.csv"), header = TRUE, sep = ";")
+df_sideEffects$participant <- str_pad(df_sideEffects$participant, 2, pad = "0")
+df_sideEffects <- df_sideEffects %>% 
+  select(-c(date, Kommentare.))
+
+df_sideEffects <- df_sideEffects %>% 
+  mutate(sideEffects_sum = rowSums(across(c(pain_skin_head, toothache, tingling_head_skin, tingling_body, itching, burning_heat, headache, auditory_perception.tinnitus., skin_sensation, muscle_contraction, tiredness, sleepiness, hearing_changes, mood_change_negative, mood_change_positive, sickness, neck_pain_stiffness, coil_pressure, fear_nervousness, concentration_difficulty))))
+
+df_sideEffects_summary <- df_sideEffects %>% 
+  select(c(participant, session, sideEffects_sum))
+
+# join with large df
+df_all_data_raw <- full_join(df_all_data_raw, df_sideEffects_summary)
+```
+
+# Demographic information
+```{r demographic data}
+path_data_folder <- here::here("Raw_data/Training/")
+
+# Get list of all .csv files in the data folder
+file_list <- list.files(path = path_data_folder, pattern = "^sub-.*\\.csv$")
+
+# Placeholders df for demographics, questions & text data
+df_demographics_raw     <- data.frame()
+
+# Loop files in my file list aka directory
+for (i in 1:length(file_list)) {
+
+  # Read in current file
+  subj_df <- read.csv(paste(path_data_folder, file_list[i],sep = ""), sep = "\t")
+
+  # If the df is separated by a semicolon instead of a comma, we only get
+  # one messed-up column. In this case, use semicolon as separator for csv:
+  if (ncol(subj_df) == 1) {
+    subj_df <- read.csv(paste(path_data_folder, file_list[i],sep = ""), sep = ",")
+  }
+  
+  id <- subj_df$participant[i]
+  
+  # print message
+  message(paste(i, " - Reading in file ", file_list[i], ", participant ID: ", id, sep = ""))
+
+  # rename block_kind column
+  subj_df <- subj_df %>% 
+    rename(nback_level = block_kind)
+  
+  subj_df$participant <- gsub("sub-", "", subj_df$participant)
+  
+  #create new columns for demographics and education answers and fill them with the corresponding answers
+  subj_df$gender <- NA 
+  subj_df$age <- NA
+  subj_df$native_German <- NA
+  subj_df$dyslexia <- NA
+  subj_df$vision_glasses <- NA
+  subj_df$vision_lenses <- NA
+  subj_df$handedness <- NA
+  subj_df$education <- NA
+  subj_df$edu_years <- NA
+  subj_df$edu_profession <- NA
+  
+  subj_df$gender <- subj_df$demographic_form.response[4]
+  subj_df$age <- subj_df$demographic_form.response[5]
+  subj_df$native_German <- subj_df$demographic_form.response[6]
+  subj_df$dyslexia <- subj_df$demographic_form.response[7]
+  subj_df$vision_glasses <- subj_df$demographic_form.response[8]
+  subj_df$vision_lenses <- subj_df$demographic_form.response[9]
+  subj_df$handedness <- subj_df$demographic_form.response[10]
+  subj_df$education <- subj_df$education_form.response[13]
+  subj_df$edu_profession <- subj_df$education_form.response[21]
+  
+  #demographics <- subj_df[,c("participant", "gender", "age", "language", "dyslexia", "vision_glasses", "vision_lenses", "handedness", "education", "edu_profession", "edu_years")]
+  #subj_demographics[i] <- demographics
+
+  # replace , with . to conform with standard numeric format
+  subj_df$education_form.response <- gsub(",", ".", subj_df$education_form.response)
+
+  # extract number including decimal
+  subj_df$education_years <- sapply(subj_df$education_form.response, function(x) str_extract(x, "\\d+(\\.\\d+)?"))
+
+  # convert to numeric
+  subj_df$education_years <- as.numeric(subj_df$education_years)
+
+  # get the total sum and replace 'edu_years' with that sum
+  total_sum <- sum(subj_df$education_years, na.rm = TRUE)
+  subj_df$education_years <- total_sum
+
+
+  # GET RAW TEXT & N-BACK DATA
+  subj_df <- subset(subj_df, select=c(participant, gender, native_German, dyslexia, vision_glasses, vision_lenses, handedness, education, edu_profession, education_years))
+
+  subj_df <- subj_df %>% 
+    distinct()
+  
+  # append subj_df chunk to df_text_data where we collect the data of all participants we want to keep
+  df_demographics_raw <- as.data.frame(rbind(df_demographics_raw, subj_df))
+}
+
+df_demographics_raw$participant <- str_pad(df_demographics_raw$participant, 2, pad = "0")
+
+# join with large df
+df_all_data_raw <- full_join(df_all_data_raw, df_demographics_raw)
+
+# Finally, save df ----
+saveRDS(df_all_data_raw, here::here("RData/df_all_data_raw.rds"))
+```
+
+# Identify outliers in reaction times
+```{r}
+df_all_data_clean <- df_all_data_raw
+
+### TRANSFORM RT DATA ####
+
+# transf_val = sqrt (  ( x - sample_min ) / ( sample_max - sample_min)  )
+# --> after this, z-transform all values and exclude all values exceeding a value of ± 2 (or ± 3, but they used 2 in the paper)
+
+# This is basically a POMS (Little (2013), read in Moeller (2013)) transformation where you get
+# the square root of the output afterwards and z-transform everything.
+
+# Careful, normally, if you wanted to use the transformed values for group comparisons later, 
+# you'd have to to the transformation across participants & conditions, so everything gets "pulled" into the same range.
+# If you do this for each subject & condition separately, you can't compare means
+# anymore, because every subset of data would have its own scale.
+
+# Here, we only want to use the transformation for identifying & excluding outliers, so we don't really care about this problem. 
+# So we can do this on block level, so we don't exclude more trials from "slower" 2-back blocks than from the BL for example.
+
+# create new column in df_all_data_clean for the transformed RTs:
+df_all_data_clean$tmp_transformed_RTs <- NA 
+
+# get min reading time
+# sample_min <- min(df_text_data$duration)
+sample_min <- 0 # use smallest possible value here (this is described in a book by Little, 2013) - in this case: 0 words / 100 ms
+
+# loop participants:
+message("start excluding trials (block-wise)")
+for (curr_id in unique(df_all_data_clean$participant)){
+  
+  message("current participant: ", curr_id)
+  
+  # get data of current participant:
+  curr_df <- subset(df_all_data_clean, participant == curr_id)
+  
+  # loop sessions:
+  for (curr_session in unique(curr_df$session)){
+    
+    # get df for curr session
+    curr_sess <- subset(curr_df, session == curr_session)
+
+    # loop blocks:
+    for (curr_block in unique(curr_sess$block_nr_exp)){
+    
+      # get data of current block:
+      curr_block_data <- subset(curr_sess, block_nr_exp == curr_block)
+  
+      # get max reading time (use sample maximum here)
+      sample_max <- max(curr_block_data$RT)
+  
+      # do sqrt(POMS) transform of raw reading time values
+      duration_standardized <- sqrt((curr_block_data$RT - sample_min) / (sample_max - sample_min))
+  
+      # z-transform reading data
+      duration_standardized <- as.vector(scale(duration_standardized, center = T, scale = T))
+  
+      # put the transformed values into the big df with data of all participants:
+      df_all_data_clean[which(df_all_data_clean$participant == curr_id & 
+                                df_all_data_clean$session == curr_session &
+                                df_all_data_clean$block_nr_exp == curr_block), ]$tmp_transformed_RTs <- duration_standardized
+      
+      # check how many trials we have that are < -2 or > 2:
+      trials_excluded <- length(which(duration_standardized > 3 | duration_standardized < -3))
+    }# END LOOP BlOCKS
+  } # END SESSION LOOP
+} # END LOOP PARTICIPANTS
+
+
+# get index of all values < - 2 or > 2
+excl_row_idx <- which(df_all_data_clean$tmp_transformed_RTs < -3 | df_all_data_clean$tmp_transformed_RTs > 3)
+
+# check how the corresponding untransformed RTs look like so we get a feeling for what's being excluded:
+# densityplot(df_all_data_clean[excl_row_idx, "duration"])
+
+# kick out the outliers:
+df_all_data_clean[excl_row_idx, "excl_trial"] <- TRUE
+# total number of excluded trials
+(excl_trials <- length(excl_row_idx)) # 2140 trials
+
+# calculate % of excl trials
+(excl_trials/length(df_all_data_clean$participant))*100
+
+df_all_data_clean <- subset(df_all_data_clean, excl_trial == FALSE)
+
+# drop column with the z-sqrt-POMS-transformed data, we don't need it anymore.  
+df_all_data_clean$tmp_transformed_RTs <- NULL
+
+#densityPlot(df_all_data_clean$RT)
+```
+
+# Some renaming of columns
+```{r df_all_data_clean renaming}
+# rename some columns
+df_all_data_clean <- df_all_data_clean %>% 
+  rename(task = block_name,
+         cognitive_load = nback_level)
+
+# recode values in cognitive_load column
+df_all_data_clean <- df_all_data_clean %>% 
+  mutate(cognitive_load = case_when(
+    str_detect(cognitive_load, "None") ~ "Reading_only",
+    str_detect(cognitive_load, "1") ~ "1-back",
+    str_detect(cognitive_load, "2") ~ "2-back",
+  ))
+
+# recode values in stimulation condition column
+df_all_data_clean <- df_all_data_clean %>% 
+  mutate(stim_type = case_when(
+    stim_type == "sham" ~ "Sham",
+    stim_type == "offline_online" ~ "Offline + Online",
+    stim_type == "offline" ~ "Offline"
+  ))
+
+# turn the values into factors and set their order
+df_all_data_clean$cognitive_load <- factor(df_all_data_clean$cognitive_load,
+                                  levels = c("Reading_only", "1-back", "2-back"))
+
+# same for stimulation condition
+df_all_data_clean$stim_type <- as.factor(df_all_data_clean$stim_type)
+df_all_data_clean$stim_type <- factor(df_all_data_clean$stim_type,
+                                  levels = c("Sham", "Offline", "Offline + Online"))
+
+# add column for trial_index in one session
+df_all_data_clean <- df_all_data_clean %>%
+  arrange(participant, stim_type, block_nr_exp) %>%
+  group_by(participant, stim_type) %>%
+  mutate(trial_index_session = row_number())
+
+# create a column for time that sets first trial of each session to 0 and calculates time to next trial so we get a measure of time progress in s across one session
+df_all_data_clean <- df_all_data_clean %>%
+  arrange(participant, stim_type, trial_index_session) %>%
+  group_by(participant, stim_type, date) %>%
+  mutate(
+    time_from_onset_session = as.numeric(global_onset_time - first(global_onset_time), units = "secs")
+  ) %>%
+  ungroup()
+
+
+# Check for similar length of sessions
+df_subset <- df_all_data_clean %>% 
+  group_by(participant, stim_type) %>% 
+  mutate(session_length_s = max(time_from_onset_session) - min(time_from_onset_session)) %>% 
+  select(participant, stim_type, session_length_s) %>% 
+  distinct()
+
+(plot_session_length <- ggplot(df_subset, aes(x = stim_type, y = session_length_s)) +
+    #geom_violinhalf(position = position_nudge(x = 0.05), width = 1.2) +
+    geom_boxplot(width = 0.4) +
+    stat_summary(fun = mean, geom = "text", aes(label = sprintf("M=%.1f", after_stat(y))), vjust = -1.5, size = 2.5, color = "blue", fontface = "bold") +
+    stat_summary(fun = min, geom = "text", aes(label = sprintf("min=%.0f", after_stat(y))), vjust = 1.5, size = 2, color = "grey30") +
+    stat_summary(fun = max, geom = "text", aes(label = sprintf("max=%.0f", after_stat(y))), vjust = -0.5, size = 2, color = "grey30") +
+    scale_x_discrete(expand = expansion(add = c(0.8, 0.5))) +  
+    #facet_grid(~stim_type) +
+    theme_bw() +
+    theme(#legend.position = "none",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         strip.background = element_blank(),
+         plot.title = element_text(size = 10),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 8),
+         axis.title.x = element_blank(),
+         axis.text.x = element_text(angle = 45, hjust = 1),
+         axis.text.x.bottom = element_text(size = 8))
+)
+ggsave(plot_session_length, file = here::here("Plots/plot_session_length.png"), width = 100, height = 100, units = "mm")
+
+m_sessionLength <- lmerTest::lmer(session_length_s ~
+                                    stim_type +
+                                    (1|participant),
+                                  data = df_subset, 
+                                  REML = TRUE)
+summary(m_sessionLength)
+```
+
+# D-prime cleaning
+```{r dprime cleaning}
+# Check for blocks that have dprime close to or below 0 since this would indicate that participants didn't perform the task properly
+dprime_outliers <- subset(df_all_data_clean, task != "Reading_Baseline_main_click")
+dprime_outliers_n <- dprime_outliers %>% group_by(participant, stim_type, block_nr_exp) %>% count(dprime <= 0)
+dprime_outliers_n %>% group_by(stim_type) %>% summarise(sum(`dprime <= 0` == TRUE))
+blocks2exclude <- dprime_outliers %>% 
+  filter(dprime <= 0) %>% 
+  dplyr::select(participant, session, block_nr_exp, dprime) %>% 
+  distinct()
+
+# Calculate % excluded trials
+excl_trials <- df_all_data_clean %>%
+  semi_join(blocks2exclude, by = c("participant", "session", "block_nr_exp"))
+(length(excl_trials$participant)/length(dprime_outliers$participant))*100
+
+# Let's remove those entries from our original df
+df_all_data_no_outliers <- anti_join(df_all_data_clean, blocks2exclude, by = c("participant", "session", "block_nr_exp", "dprime"))
+
+df_all_data_clean <- df_all_data_no_outliers
+```
+
+# Add e-field values
+```{r e-fields}
+df_efields_ext <- readRDS(here::here("RData/df_efields_ext.rds"))
+
+df_all_data_clean <- full_join(df_all_data_clean, df_efields_ext)
+```
+
+# Add PCD (pulse-wise coil displacement)
+```{r PCD}
+# read pre-computed PCD values
+df_PCD = read.csv(here::here("PCD/pcd_combined.csv"))
+
+# some participants have more tracked pulses than 1500 (max for AG offline rTMS: 1500 pulses), let's limit this
+df_PCD <- df_PCD %>%
+  filter(!(target == "AG" & idx > 1500)) %>% 
+  rename(stim_type = session,
+         participant = sub,
+         trigger_idx = idx,
+         PCD_target = target)
+df_PCD$participant <- gsub("sub-", "", df_PCD$participant)
+
+# exclude unrealistic PCD values (PCD > 20)
+df_PCD <- df_PCD %>% 
+  filter(abs(PCD) < 20)
+
+# calc mean for AG session
+df_PCD <- df_PCD %>% 
+  group_by(participant, stim_type) %>% 
+  #mutate(PCD_q99 = quantile(PCD, probs = 0.99)) %>% 
+  #filter(abs(PCD) <= PCD_q99) %>% 
+  mutate(
+    PCD = case_when(
+      PCD_target == "AG" ~ mean(PCD),
+      PCD_target == "DLPFC" ~ PCD
+    )
+  ) %>% 
+  select(-trigger_idx, -interpolated) %>% 
+  distinct() %>% 
+  group_by(participant, stim_type, PCD_target) %>% 
+  mutate(trigger_idx = row_number())
+
+# for now, exclude PCD for AG (offline) in offline_online session
+df_PCD <- df_PCD %>% 
+  filter(!(stim_type == "offline_online" & PCD_target == "AG"))
+
+# add idx for trigger to large df
+test <- df_all_data_raw %>% 
+  group_by(participant, stim_type) %>% 
+  mutate(trigger_present = ifelse(!is.na(trigger_time), 1, 0),
+         trigger_idx = cumsum(trigger_present)) %>% 
+  select(-trigger_present)
+
+# combine both dfs
+test_all <- full_join(df_PCD, test)
+
+# fix up NA values
+test_all <- test_all %>% 
+  group_by(participant) %>% 
+  mutate(
+    PCD_target = case_when(
+      stim_type == "sham" ~ "sham",
+      stim_type == "offline_online" ~ "DLPFC",
+      stim_type == "offline" ~ "AG",
+      TRUE ~ PCD_target),
+    PCD_AG = first(PCD[PCD_target == "AG" & !is.na(PCD)]),
+    PCD = case_when(
+      # keep all existing non-NA values
+      !is.na(PCD) ~ PCD,
+      
+      # offline: replace NA with that participant's AG PCD
+      stim_type == "offline" ~ PCD_AG,
+      
+      # offline_online: replace NA with median PCD of offline_online rows
+      stim_type == "offline_online" ~ median(PCD[stim_type == "offline_online"], na.rm = TRUE),
+      
+      stim_type == "sham" ~ 0,
+      
+      # sham or anything else: leave as is (NA)
+      TRUE ~ PCD
+    )) %>% 
+  select(-PCD_AG)
+
+# sub 17 doesn't have PCD values for offline_online session!
+  
+
+# exclude rows based on 99 quantile PCD?
+
+
+
+df_PCD <- df_PCD %>% 
+  group_by(participant, stim_type) %>% 
+  mutate(PCD_q99 = quantile(PCD, probs = 0.99)) %>% 
+  filter(abs(PCD) <= PCD_q99) %>% 
+  mutate(
+    PCD = case_when(
+      target == "AG"    ~ mean(PCD),
+      target == "DLPFC" ~ PCD
+    )
+  ) %>% 
+  select(-idx, -interpolated, -PCD_q99) %>% 
+  distinct() %>% 
+  group_by(participant, stim_type, target) %>% 
+  mutate(idx = row_number())
+
+# how many pulse indices do we have in the other df?
+test2 <- t %>% 
+  group_by(participant, stim_type) %>% 
+  #filter(!is.na(trigger_time)) %>% 
+  select(maximum_triggers_this_block, minimum_triggers_this_condition, total_triggers_sent_this_condition, trigger_time, trigger_present, trigger_idx)
+
+```
+
+# Save cleaned df
+```{r save clean df}
+# exclude session 2 for participant 07, stim_type offline, since there was an error in this session with the experiment
+df_all_data_clean <- df_all_data_clean %>% 
+  filter(!(participant == "07" & session == 2))
+
+# Save df
+saveRDS(df_all_data_clean, file = here::here("RData/df_all_data_clean.rds"))
+```

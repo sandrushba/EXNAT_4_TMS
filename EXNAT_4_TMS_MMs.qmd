@@ -1,0 +1,1641 @@
+---
+title: "EXNAT_4_TMS Preprocessing"
+author: "Sandra Martin"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    code-fold: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r file setup, echo = FALSE}
+rm(list = ls()) # clear environment
+knitr::opts_chunk$set() # set default options for all code blocks in this document
+options(scipen = 999) # don't use scientific notation for very large or small numbers
+n.cores <- max(1, parallel::detectCores() %/% 2, na.rm = T) # Use half of the available cores
+emm_options(rg.limit = 1000000) # for emm calculations
+```
+
+# Load packages
+```{r packages, echo = FALSE, message = FALSE, warning = TRUE}
+# Create a list with needed libraries
+pkgs <- c("here", # for working with relative paths
+          "ggeffects",
+          "emmeans",
+          "ggplot2", # for plots
+          "dplyr", # for replacing multiple values in vector with different values
+          "tidyverse", # for aggregating
+          "easystats", # includes performance, see, insight, modelbased
+          #"lme4", # also for linear mixed emodels, but no p-values in the summary
+          "lmerTest", # extension of lme4 - for tab_model() for showing lme4 model results
+          "glmmTMB",
+          "brms",
+          "cmdstanr",
+          "mgcv",
+          "gratia",
+          "itsadug",
+          "ggside",
+          "ggpubr",
+          "car", # for basic Anova() function & aGSIFs (= basically weird adjusted VIFs)
+          "sjPlot", # for running Anova & showing results in a HTML table in the Viewer
+          "colorspace", # for beautiful and balanced color palettes
+          "egg") # creating patchwork plots
+
+# Load each listed library, check if it's already installed
+# and install if necessary
+for (pkg in pkgs){
+  if(!require(pkg, character.only = TRUE)){
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+today <- Sys.Date()
+today <- format(today, format="%y%m%d")
+
+source(here::here("get_dprime.R")) # get script
+```
+
+# Load R Data
+```{r}
+df_all_data_clean <- readRDS(here::here("RData/df_all_data_clean.rds")) # df with all trials and participants incl demographic information
+#single_nback_df <- readRDS(here::here("RData/single_nback_df.rds"))
+#reading_only_df <- readRDS(here::here("RData/reading_only_df.rds"))
+#dual_task_df <- readRDS(here::here("RData/dual_task_df.rds"))
+#df_comprehension_Qs <- readRDS(here::here("RData/df_comprehension_questions.rds"))
+```
+
+# Settings for plots
+```{r Theme for plots, echo = FALSE}
+today <- Sys.Date()
+today <- format(today, format="%y%m%d")
+
+# Custom colour palettes for the plots:
+palet_task_condition <- c("#D2BFE7",
+                      "#977FB2") 
+palet_task_condition_lines <- c("#ad8bd3",
+                      "#7B5EC6") 
+
+# for distinguishing between cognitive load conditions: 
+# cols_reading <- c("#575A7B", # Reading Only
+#                 "#ED9201", # 1-back
+#                 "#982126") # 2-back
+cols_reading <- c("#F8A29E", "#9F4D48", "#4B201D")
+cols_dual <- c("#D2BFE7", "#9b84b7", "#56476D")
+cols_single_nback <- c("#74BDC7", "#408A95", "#156570", "#064E58")
+```
+
+# N-BACK ANALYSIS: N-BACK TASK & DUAL TASK
+## Df for n-back tasks
+```{r df for single n-back}
+nback_df <- subset(df_all_data_clean, task != "Reading_Baseline_main_click")
+nback_df <- droplevels(nback_df)
+```
+
+## Prepare df, contrast coding
+```{r prepare data for stats single n-back, echo = FALSE}
+# add column with information whether there was a TMS burst in a certain trial or not
+nback_df <- nback_df %>% 
+  mutate(is_trigger = case_when(
+    stim_type != "Offline" & !is.na(trigger_time) ~ "True",
+    stim_type != "Offline" & is.na(trigger_time) ~ "False",
+    stim_type == "Offline" ~ "False"
+  ))
+
+# if the n-back trial was in the dual task (adding level to cognitive load column)
+nback_df <- nback_df %>% 
+  mutate(cognitive_load = case_when(
+    task == "2back_dual_main_click" ~ "dual task",
+    TRUE ~ "single task"
+  ))
+
+# simple coding ----
+# create a simple coding scheme for reaction (2 levels), is_trigger, cognitive_load
+c <- contr.treatment(2) 
+my.coding <- matrix(rep(1/2, 2), ncol = 1) 
+my.simple <- c-my.coding
+
+nback_df$reaction <- as.factor(nback_df$reaction)
+contrasts(nback_df$reaction) <- my.simple
+
+nback_df$is_trigger <- as.factor(nback_df$is_trigger)
+contrasts(nback_df$is_trigger) <- my.simple
+
+nback_df$cognitive_load <- as.factor(nback_df$cognitive_load)
+contrasts(nback_df$cognitive_load) <- my.simple
+
+# simple coding for stimulation type, session, block name, cognitive_load
+c <- contr.treatment(3) 
+my.coding <- matrix(rep(1/3, 6), ncol = 2) 
+my.simple <- c-my.coding
+
+nback_df$stim_type <- factor(nback_df$stim_type, levels = c("Sham", "Offline", "Offline + Online"))
+contrasts(nback_df$stim_type) <- my.simple
+
+nback_df$session <- as.factor(nback_df$session)
+contrasts(nback_df$session) <- my.simple
+
+nback_df$task <- as.factor(nback_df$task)
+contrasts(nback_df$task) <- my.simple
+
+# simple coding for stimulation order (6 levels)
+c <- contr.treatment(6) 
+my.coding <- matrix(rep(1/6, 30), ncol = 5) 
+my.simple <- c-my.coding
+nback_df$Stim_Order <- as.factor(nback_df$Stim_Order)
+contrasts(nback_df$Stim_Order) <- my.simple
+
+# create a column for time that sets first trial of each task to 0 and calculates time to next trial so we get a measure of time progress in s across one session
+nback_df <- nback_df %>%
+  arrange(participant, stim_type, trial_index_session) %>%
+  group_by(participant, stim_type, date, task) %>%
+  mutate(
+    time_from_onset_task = as.numeric(global_onset_time - first(global_onset_time), units = "secs"),
+    task_onset = first(time_from_onset_session),
+    block_nr_task = cumsum(trial_nr == 1)
+  ) %>%
+  ungroup()
+
+# change RT for n-back trials
+# if participants pressed the target nback button, use the nback_RT as reaction time instead of RT
+nback_df$nback_RT <- as.integer(nback_df$nback_RT)
+nback_df <- nback_df %>% 
+  mutate(new_RT = case_when(
+    str_detect(cognitive_load, "back") & reaction == TRUE ~ nback_RT,
+    .default = RT
+  ))
+
+# add column whether the previous trial and second to last trials were an n-back target or not and whether the previous response was correct or incorrect
+nback_df <- nback_df %>%
+  group_by(participant, stim_type, block_nr_exp) %>%
+  mutate(
+    # Previous trial was target (lag 1)
+    prev_target = lag(target, n = 1, default = NA),
+    
+    # Second-to-last trial was target (lag 2)
+    prev2_target = lag(target, n = 2, default = NA),
+    
+    # Previous trial accuracy (for post-error effects)
+    prev_correct = lag(nback_response, n = 1, default = NA),
+    
+    # RT of previous trial
+    previous_duration = lag(new_RT, n = 1, default = NA)
+  ) %>%
+  ungroup()
+
+# Create column that codes nback acc as correct/incorrect instead of four levels (avoids collinearity with reaction predictor in model)
+nback_df <- nback_df %>% 
+  mutate(nback_acc = case_when(
+    nback_response == "correct rejection" ~ "correct",
+    nback_response == "hit" ~ "correct",
+    nback_response == "false alarm" ~ "incorrect",
+    nback_response == "miss" ~ "incorrect",
+  ))
+
+# simple coding previous reaction, previous target, previous2 target, nback_acc
+c <- contr.treatment(2) 
+my.coding <- matrix(rep(1/2, 2), ncol = 1) 
+my.simple <- c-my.coding
+
+nback_df$previous_reaction[nback_df$previous_reaction == ""] <- NA
+nback_df$previous_reaction <- as.factor(nback_df$previous_reaction)
+nback_df$previous_reaction <- droplevels(nback_df$previous_reaction)
+contrasts(nback_df$previous_reaction) <- my.simple
+
+nback_df$prev_target <- as.factor(nback_df$prev_target)
+contrasts(nback_df$prev_target) <- my.simple
+
+nback_df$prev2_target <- as.factor(nback_df$prev2_target)
+contrasts(nback_df$prev2_target) <- my.simple
+
+nback_df$nback_acc <- as.factor(nback_df$nback_acc)
+contrasts(nback_df$nback_acc) <- my.simple
+
+# Re-calculate d-prime: separate d-prime for trials with online stimulation and not (makes 2 d-prime values per text)
+nback_df <- nback_df %>% 
+  group_by(participant, stim_type, task, block_nr_exp, is_trigger) %>% 
+  mutate(dprime_new = get_dprime(nback_response))
+
+nback_df$Age <- as.numeric(nback_df$Age)
+
+# Add the information how many triggers there were per block 
+# Ultimately doesn't perform well in models because there was no online trigger in the offline session leading to overall weird estimates
+# CAVE: this is centred within the offline+online & sham session and NOT the offline session since there were no triggers per block in this session
+# nback_df <- nback_df %>% 
+#   group_by(participant, stim_type, block_names_numbered) %>% 
+#   mutate(trigger_per_block = sum(is_trigger == "True")) %>% 
+#   ungroup()
+# nback_df <- nback_df %>%
+#   mutate(
+#     grand_mean_nonoffline = mean(trigger_per_block[stim_type != "Offline"], na.rm = TRUE),
+#     trigger_per_block_centered = case_when(
+#       stim_type == "Offline" ~ 0,
+#       TRUE ~ trigger_per_block - grand_mean_nonoffline
+#     )
+#   ) %>%
+#   select(-grand_mean_nonoffline, -trigger_per_block)  # Clean up temporary variable
+# nback_df$trigger_per_block_centered <- as.numeric(nback_df$trigger_per_block_centered)
+
+# save single n-back df ----
+# saveRDS(nback_df, file = here::here("RData/nback_df.rds"))
+```
+
+## Reaction time analysis
+```{r}
+# look at RT
+hist(log(nback_df$new_RT))
+hist(nback_df$new_RT)
+fitdistrplus::descdist(nback_df$new_RT)
+fitdistrplus::descdist(log(nback_df$new_RT))
+
+# For statistical models, remove first trials w/o previous duration
+nback_df <- subset(nback_df, !is.na(previous_duration))
+nback_df <- subset(nback_df, new_RT > 100)
+
+# LMM ----
+nback_m2 <- lmerTest::lmer(log(new_RT) ~
+                         stim_type +
+                         session +
+                         task +
+                         reaction +
+                         previous_reaction + # 
+                         target + # 
+                         prev_target + # 
+                         nback_acc + # 
+                         is_trigger +
+                         task_onset +
+                         scale(trial_nr, scale = FALSE) +
+                         # scale(block_nr_task, scale = FALSE) + strongly correlated with time from session
+                         #scale(time_from_onset_session, scale = FALSE) +
+                         scale(time_from_onset_task, scale = FALSE) +   
+                         RS +
+                         executive_sum +
+                         scale(education_years, scale = FALSE) +
+                         scale(Age, scale = FALSE) +
+                         sideEffects_sum +
+                         log(previous_duration) +
+                         #efield_AG +
+                         #efield_DLPFC +  
+                         #stim_type:reaction + # unnecessary
+                         stim_type:nback_acc + # keep
+                         stim_type:task +
+                         #task:trial_nr+
+                         #stim_type:task:trial_nr +
+                         #nback_acc:is_trigger + # unnecessary
+                         (1 + stim_type + task + reaction | participant),
+                       data = nback_df,
+                       REML = FALSE,
+                       control = lmerControl(optimizer = "bobyqa")
+)
+
+# only trials with n-back response ----
+nback_only_nback_trials <- subset(nback_df, reaction == TRUE)
+nback_only_nback_trials <- nback_only_nback_trials %>% 
+  ungroup() %>% 
+  mutate(across(where(is.character), as.factor))
+
+gamm_RT_only_nback <- bam(log(new_RT) ~
+                         stim_type +
+                         session +
+                         task +
+                         nback_acc + # 
+                         is_trigger +
+                         # task_onset + # better without
+                         s(trial_nr, k = 30) + # slope no
+                         s(time_from_onset_session, k = 20) + # time from onset session performs slightly better
+                         #s(time_from_onset_task, k = 20) +   
+                         RS +
+                         executive_sum +
+                         education_years +
+                         Age +
+                         sideEffects_sum +
+                         #log(previous_duration) +
+                         #efield_AG +
+                         #efield_DLPFC +  
+                         stim_type:task +
+                         stim_type:nback_acc +
+                         #task:trial_nr+
+                         #stim_type:task:trial_nr +
+                         #nback_acc:is_trigger + # unnecessary
+                         s(time_from_onset_session, by = stim_type, k = 20) + # better model with time_from_onset_session int
+                         s(participant, bs = "re") +
+                         s(participant, by = stim_type, bs = "re") +
+                         s(participant, by = task, bs = "re"),
+              data = nback_only_nback_trials,
+              method = "fREML",
+              discrete = TRUE,
+              #nthreads = n.cores,
+              control = gam.control(nthreads = n.cores),
+)
+
+gam.check(gamm_RT_only_nback)
+
+summary(gamm_RT_only_nback)
+
+# equivalent linear model
+lmm_nback_only <- lmerTest::lmer(log(new_RT) ~
+                         stim_type +
+                         session +
+                         task +
+                         nback_acc + # 
+                         is_trigger +
+                         #task_onset +
+                         scale(trial_nr, scale = FALSE) + # slope no
+                         scale(time_from_onset_session, scale = FALSE) +
+                         #time_from_onset_task +   
+                         RS +
+                         executive_sum +
+                         scale(education_years, scale = FALSE) +
+                         scale(Age, scale = FALSE) +
+                         sideEffects_sum +
+                         #log(previous_duration) +
+                         #efield_AG +
+                         #efield_DLPFC +  
+                         #stim_type:reaction + # unnecessary
+                         stim_type:task +
+                         stim_type:nback_acc + # keep
+                         stim_type:scale(time_from_onset_session, scale = FALSE) +
+                         #task:trial_nr+
+                         #stim_type:task:trial_nr +
+                         #nback_acc:is_trigger + # unnecessary
+                         (1 + stim_type + task | participant),
+                       data = nback_only_nback_trials,
+                       REML = FALSE,
+                       control = lmerControl(optimizer = "bobyqa")
+)
+
+compare_performance(gamm_RT_only_nback, lmm_nback_only)
+summary(lmm_nback_only)
+
+## plot results
+
+
+# only trials with correct n-back response ----
+nback_only_correct_nback_trials <- subset(nback_df, reaction == TRUE & nback_acc == "correct")
+#nback_only_correct_nback_trials <- droplevels(nback_only_correct_nback_trials)
+
+lmm_nback_only_correct <- lmerTest::lmer(log(new_RT) ~
+                         stim_type +
+                         session +
+                         task +
+                         #reaction +
+                         #previous_reaction + # 
+                         #target + # 
+                         #prev_target + # 
+                         #nback_acc + # 
+                         is_trigger +
+                         task_onset +
+                         trial_nr + # slope no
+                         time_from_onset_session +
+                         #time_from_onset_task +   
+                         RS +
+                         executive_sum +
+                         education_years +
+                         Age +
+                         sideEffects_sum +
+                         #log(previous_duration) +
+                         #efield_AG +
+                         #efield_DLPFC +  
+                         #stim_type:reaction + # unnecessary
+                         #stim_type:nback_acc + # keep
+                         stim_type:task +
+                         stim_type:time_from_onset_session +
+                         #task:trial_nr+
+                         #stim_type:task:trial_nr +
+                         #nback_acc:is_trigger + # unnecessary
+                         (1 + stim_type + task | participant),
+                       data = nback_only_correct_nback_trials,
+                       REML = FALSE,
+                       control = lmerControl(optimizer = "bobyqa")
+)
+summary(lmm_nback_only_correct)
+
+## GAMM ----
+nback_only_correct_nback_trials <- nback_only_correct_nback_trials %>% 
+  ungroup() %>% 
+  mutate(across(where(is.character), as.factor))
+
+gamm_RT_only_correct_nback <- bam(log(new_RT) ~
+                         stim_type +
+                         session +
+                         task +
+                         #reaction +
+                         #previous_reaction + # 
+                         #target + # 
+                         #prev_target + # 
+                         #nback_acc + # 
+                         is_trigger +
+                         #task_onset +
+                         s(trial_nr, k = 20) + # slope no
+                         s(time_from_onset_session, k = 20) +
+                         #time_from_onset_task +   
+                         RS +
+                         executive_sum +
+                         education_years +
+                         Age +
+                         sideEffects_sum +
+                         #log(previous_duration) +
+                         #efield_AG +
+                         #efield_DLPFC +  
+                         stim_type:task +
+                         #stim_type:nback_acc +
+                         #task:trial_nr+
+                         #stim_type:task:trial_nr +
+                         #nback_acc:is_trigger + # unnecessary
+                         s(time_from_onset_session, by = stim_type, k = 20) + # better model with time_from_onset_session int
+                         s(participant, bs = "re") +
+                         s(participant, by = stim_type, bs = "re") +
+                         s(participant, by = task, bs = "re"),
+              data = nback_only_correct_nback_trials,
+              method = "fREML",
+              discrete = TRUE,
+              #nthreads = n.cores,
+              control = gam.control(nthreads = n.cores),
+)
+summary(gamm_RT_only_correct_nback)
+
+compare_performance(lmm_nback_only_correct, gamm_RT_only_correct_nback)
+
+# ONLINE TRIALS ONLY (Separate analysis for online trials) ----
+nback_df_online <- subset(nback_df, is_trigger == "True")
+nback_df_online <- droplevels(nback_df_online)
+
+# new contrast coding for stim type since we're loosing one level
+c <- contr.treatment(2) 
+my.coding <- matrix(rep(1/2, 2), ncol = 1) 
+my.simple <- c-my.coding
+contrasts(nback_df_online$stim_type) <- my.simple
+
+### LMM ----
+lmm_RT_single_nback_online <- lmer(log(RT) ~
+                         stim_type +
+                         session +
+                         cognitive_load +
+                         reaction +
+                         previous_reaction + # 
+                         target + # 
+                         prev_target + # 
+                         nback_acc + # 
+                         scale(task_onset, scale = FALSE) +
+                         scale(trial_nr, scale = FALSE) + # slope no
+                         scale(time_from_onset_nback, scale = FALSE) +
+                         scale(RS, scale = FALSE) +
+                         scale(executive_sum, scale = FALSE) +
+                         scale(education_years, scale = FALSE) +
+                         scale(Age, scale = FALSE) +
+                         scale(sideEffects_sum, scale = FALSE) +
+                         scale(log(previous_duration), scale = TRUE) +
+                         cognitive_load:stim_type +
+                         reaction:stim_type +
+                         nback_acc:stim_type +
+                         # nback_acc:stim_type:cognitive_load + # VIF too high
+                         scale(task_onset, scale = FALSE):stim_type +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type:cognitive_load +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type:scale(task_onset, scale = FALSE) +
+                         (1 + stim_type * cognitive_load + reaction | participant),
+                       data = nback_df_online,
+                       REML = FALSE,
+                       control = lmerControl(optimizer = "bobyqa")
+)
+check_model(lmm_RT_single_nback_online)
+summary(lmm_RT_single_nback_online)
+Anova(lmm_RT_single_nback_online)
+
+plot(predict_response(lmm_RT_single_nback_online, c("stim_type", "cognitive_load"), margin = "marginalmeeans"))
+
+# GAMM ----
+nback_df <- nback_df %>% 
+  mutate(across(where(is.character), as.factor))
+
+gamm1_RT_single_nback <- bam(RT ~
+                  stim_type +
+                  session +
+                  cognitive_load +
+                  reaction +
+                  is_trigger +
+                  cognitive_load : stim_type +
+                  s(trigger_per_block) + 
+                  s(trial_nr) +
+                  s(time_from_onset_session) +
+                  s(education_years, k = 6) +
+                  s(Age) +
+                  s(sideEffects_sum) +
+                  s(mean_dprime_singletasks) + 
+                  s(previous_duration) +
+                  s(time_from_onset_session, by = stim_type) +
+                  s(participant, by = stim_type:cognitive_load, bs = "re"),
+               data = nback_df,
+               family = Gamma(link = "log"),
+               discrete = FALSE,
+               method = "REML",
+               nthreads = 16
+)
+
+
+# BRM ----
+brms_RT_single_nback <- brm(RT ~ 
+       stim_type +
+       session +
+       cognitive_load +
+       reaction +
+       is_trigger +
+       scale(trigger_per_block, scale = FALSE) +
+       scale(trial_nr, scale = FALSE) +
+       scale(time_from_onset_session, scale = FALSE) +
+       scale(education_years, scale = FALSE) +
+       scale(Age, scale = FALSE) +
+       scale(sideEffects_sum, scale = FALSE) +
+       scale(mean_dprime_singletasks, scale = TRUE) +
+       scale(previous_duration, scale = TRUE) +
+       cognitive_load:stim_type +
+       scale(time_from_onset_session, scale = FALSE):stim_type +
+       (1 + stim_type * cognitive_load | participant),
+  data = nback_df,
+  family = Gamma(link = "log"),
+  iter = 4000, # total iterations per chain
+  warmup = 2000, # warmup (burn-in) iterations per chain
+  chains = 5, # number of chains (default is 4)
+  threads = threading(6),
+  backend = "cmdstanr",
+  inits = 0
+)
+
+bayes_lmm <- brm(log(RT) ~
+                         stim_type +
+                         session +
+                         cognitive_load +
+                         reaction +
+                         previous_reaction + # 
+                         target + # 
+                         prev_target + # 
+                         nback_acc + # 
+                         is_trigger +
+                         scale(task_onset, scale = FALSE) +
+                         scale(trial_nr, scale = FALSE) + # slope no
+                         scale(time_from_onset_nback, scale = FALSE) +
+                         scale(RS, scale = FALSE) +
+                         scale(executive_sum, scale = FALSE) +
+                         scale(education_years, scale = FALSE) +
+                         scale(Age, scale = FALSE) +
+                         scale(sideEffects_sum, scale = FALSE) +
+                         scale(log(previous_duration), scale = TRUE) +
+                         cognitive_load:stim_type +
+                         reaction:stim_type +
+                         nback_acc:stim_type +
+                         nback_acc:stim_type:cognitive_load +   
+                         scale(task_onset, scale = FALSE):stim_type +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type:cognitive_load +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type:scale(task_onset, scale = FALSE) +
+                         (1 + stim_type * cognitive_load + reaction | participant),
+                       data = nback_df)
+
+```
+
+## D-prime analysis
+```{r}
+# Re-calculate d-prime: separate d-prime for trials with online stimulation and not (makes 2 d-prime values per text)
+nback_df <- nback_df %>% 
+  group_by(participant, stim_type, block_nr_exp, is_trigger) %>% 
+  mutate(dprime_new = get_dprime(nback_response))
+
+nback_df_subset <- nback_df %>% 
+  select(participant, stim_type, session, cognitive_load, dprime_new, is_trigger, sideEffects_sum, block_nr_exp, RS, executive_sum, education_years, Age, task_onset) %>% 
+  distinct()
+
+lmm_single_nback_dprime <- lmerTest::lmer(dprime_new ~
+    stim_type +
+    cognitive_load +
+    is_trigger +
+    session +
+    scale(block_nr_exp, scale = FALSE) +
+    scale(education_years, scale = FALSE) +
+    scale(Age, scale = FALSE) +
+    scale(executive_sum, scale = FALSE) +
+    scale(RS, scale = FALSE) +
+    scale(sideEffects_sum, scale = FALSE) +
+    is_trigger:cognitive_load +
+    stim_type:cognitive_load +
+    (1 + cognitive_load | participant),
+  data = nback_df_subset, 
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa")
+)
+check_model(lmm_single_nback_dprime)
+summary(lmm_single_nback_dprime)
+Anova(lmm_single_nback_dprime)
+
+plot(predict_response(lmm_single_nback_dprime, "stim_type", margin = "marginalmeans"))
+plot(predict_response(lmm_single_nback_dprime, "is_trigger", margin = "marginalmeans"))
+plot(predict_response(lmm_single_nback_dprime, c("cognitive_load", "is_trigger"), margin = "marginalmeans"))
+
+# model only with online trials to explore interaction of stim type and trigger --> there is no sig interaction and there's also nothing there
+nback_df_subset_online <- subset(nback_df_subset, stim_type != "Offline")
+nback_df_subset_online <- subset(nback_df_subset_online, is_trigger != "False")
+nback_df_subset_online <- droplevels(nback_df_subset_online)
+
+lmm_single_nback_dprime_online <- lmerTest::lmer(dprime_new ~
+    stim_type +
+    cognitive_load +
+    session +
+    scale(block_nr_exp, scale = FALSE) +
+    scale(education_years, scale = FALSE) +
+    scale(Age, scale = FALSE) +
+    scale(executive_sum, scale = FALSE) +
+    scale(RS, scale = FALSE) +
+    scale(sideEffects_sum, scale = FALSE) +
+    stim_type:cognitive_load +
+    (1 + cognitive_load | participant),
+  data = nback_df_subset_online, 
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa")
+)
+
+summary(lmm_single_nback_dprime_online)
+
+plot(predict_response(lmm_single_nback_dprime_online, c("stim_type", "cognitive_load"), margin = "marginalmeans"))
+```
+
+
+
+# SINGLE N-BACK TASKS
+## Df for single n-back
+```{r df for single n-back}
+single_nback_df <- subset(df_all_data_clean, block_name == "2back_single_main_click" | block_name == "1back_single_main_click")
+single_nback_df <- droplevels(single_nback_df)
+```
+
+## Prepare df, contrast coding
+```{r prepare data for stats single n-back, echo = FALSE}
+# add column with information whether there was a TMS burst in a certain trial or not
+single_nback_df <- single_nback_df %>% 
+  mutate(is_trigger = case_when(
+    stim_type != "Offline" & !is.na(trigger_time) ~ "True",
+    stim_type != "Offline" & is.na(trigger_time) ~ "False",
+    stim_type == "Offline" ~ "False"
+  ))
+
+# simple coding ----
+# create a Simple Coding scheme for cognitive_load, reaction (2 levels), is_trigger
+c <- contr.treatment(2) 
+my.coding <- matrix(rep(1/2, 2), ncol = 1) 
+my.simple <- c-my.coding
+
+contrasts(single_nback_df$cognitive_load) <- my.simple
+
+single_nback_df$reaction <- as.factor(single_nback_df$reaction)
+contrasts(single_nback_df$reaction) <- my.simple
+
+single_nback_df$is_trigger <- as.factor(single_nback_df$is_trigger)
+contrasts(single_nback_df$is_trigger) <- my.simple
+
+# simple coding for stimulation type, session
+c <- contr.treatment(3) 
+my.coding <- matrix(rep(1/3, 6), ncol = 2) 
+my.simple <- c-my.coding
+
+#single_nback_df$stim_type <- as.factor(single_nback_df$stim_type)
+contrasts(single_nback_df$stim_type) <- my.simple
+
+single_nback_df$session <- as.factor(single_nback_df$session)
+contrasts(single_nback_df$session) <- my.simple
+
+# simple coding for stimulation order (6 levels)
+c <- contr.treatment(6) 
+my.coding <- matrix(rep(1/6, 30), ncol = 5) 
+my.simple <- c-my.coding
+single_nback_df$Stim_Order <- as.factor(single_nback_df$Stim_Order)
+contrasts(single_nback_df$Stim_Order) <- my.simple
+
+# create a column for time that sets first trial of each task to 0 and calculates time to next trial so we get a measure of time progress in s across one session
+single_nback_df <- single_nback_df %>%
+  arrange(participant, stim_type, trial_index_session) %>%
+  group_by(participant, stim_type, date) %>%
+  mutate(
+    time_from_onset_nback = as.numeric(global_onset_time - first(global_onset_time), units = "secs"),
+    task_onset = first(time_from_onset_session)
+  ) %>%
+  ungroup()
+
+single_nback_df$Age <- as.numeric(single_nback_df$Age)
+single_nback_df$previous_duration <- as.numeric(single_nback_df$previous_duration)
+
+# add column whether the previous trial and second to last trials were an n-back target or not and whether the previous was response was correct or incorrect
+single_nback_df <- single_nback_df %>%
+  group_by(participant, stim_type, block_nr_exp) %>%
+  mutate(
+    # Previous trial was target (lag 1)
+    prev_target = lag(target, n = 1, default = NA),
+    
+    # Second-to-last trial was target (lag 2)
+    prev2_target = lag(target, n = 2, default = NA),
+    
+    # Previous trial accuracy (for post-error effects)
+    prev_correct = lag(nback_response, n = 1, default = NA),
+  ) %>%
+  ungroup()
+
+# Create column that codes nback acc as correct/incorrect instead of four levels (avoids linearity with reaction predictor in model)
+single_nback_df <- single_nback_df %>% 
+  mutate(nback_acc = case_when(
+    nback_response == "correct rejection" ~ "correct",
+    nback_response == "hit" ~ "correct",
+    nback_response == "false alarm" ~ "incorrect",
+    nback_response == "miss" ~ "incorrect",
+  ))
+
+# simple coding previous reaction, previous target, previous2 target, nback_acc
+c <- contr.treatment(2) 
+my.coding <- matrix(rep(1/2, 2), ncol = 1) 
+my.simple <- c-my.coding
+
+single_nback_df$previous_reaction[single_nback_df$previous_reaction == ""] <- NA
+single_nback_df$previous_reaction <- as.factor(single_nback_df$previous_reaction)
+single_nback_df$previous_reaction <- droplevels(single_nback_df$previous_reaction)
+contrasts(single_nback_df$previous_reaction) <- my.simple
+
+single_nback_df$prev_target <- as.factor(single_nback_df$prev_target)
+contrasts(single_nback_df$prev_target) <- my.simple
+
+single_nback_df$prev2_target <- as.factor(single_nback_df$prev2_target)
+contrasts(single_nback_df$prev2_target) <- my.simple
+
+single_nback_df$nback_acc <- as.factor(single_nback_df$nback_acc)
+contrasts(single_nback_df$nback_acc) <- my.simple
+
+# change RT for n-back trials ----
+# if it was an n-back block and participants pressed a button, use the nback_RT as reaction time instead of RT
+single_nback_df$nback_RT <- as.integer(single_nback_df$nback_RT)
+single_nback_df <- single_nback_df %>% 
+  mutate(new_RT = case_when(
+    str_detect(cognitive_load, "back") & reaction == TRUE ~ nback_RT,
+    .default = RT
+  ))
+
+single_nback_df$Age <- as.numeric(single_nback_df$Age)
+single_nback_df$previous_duration <- as.numeric(single_nback_df$previous_duration)
+
+# Re-calculate d-prime: separate d-prime for trials with online stimulation and not (makes 2 d-prime values per text)
+single_nback_df <- single_nback_df %>% 
+  group_by(participant, stim_type, block_nr_exp, is_trigger) %>% 
+  mutate(dprime_new = get_dprime(nback_response))
+
+# Add the information how many triggers there were per block 
+# Ultimately doesn't perform well in models because there was no online trigger in the offline session leading to overall weird estimates
+# CAVE: this is centred within the offline+online & sham session and NOT the offline session since there were no triggers per block in this session
+single_nback_df <- single_nback_df %>% 
+  group_by(participant, stim_type, block_names_numbered) %>% 
+  mutate(trigger_per_block = sum(is_trigger == "True")) %>% 
+  ungroup()
+single_nback_df <- single_nback_df %>%
+  mutate(
+    grand_mean_nonoffline = mean(trigger_per_block[stim_type != "Offline"], na.rm = TRUE),
+    trigger_per_block_centered = case_when(
+      stim_type == "Offline" ~ 0,
+      TRUE ~ trigger_per_block - grand_mean_nonoffline
+    )
+  ) %>%
+  select(-grand_mean_nonoffline, -trigger_per_block)  # Clean up temporary variable
+single_nback_df$trigger_per_block_centered <- as.numeric(single_nback_df$trigger_per_block_centered)
+
+# save single n-back df ----
+saveRDS(single_nback_df, file = here::here("RData/single_nback_df.rds"))
+```
+
+## Plots
+### Plot RTs by Stimulation Condition
+```{r plot single n-back tasks}
+# Remove first trials w/o previous duration
+single_nback_df <- subset(single_nback_df, !is.na(previous_duration))
+
+# Also remove first two blocks of participant 07, session 2, because the experiment had to be re-started in this session
+single_nback_df <- subset(single_nback_df, !(participant == "07" & session == 2)) #& date == "2025-06-04_10h38.32.349"))
+
+# Summary df by condition
+RT_single_nback <- single_nback_df %>% 
+  group_by(stim_type, cognitive_load) %>%
+  summarise(mean_rt = mean(RT),
+            SD_rt = sd(RT),
+            std.error_rt = std.error(RT))
+
+# Summary df by condition, participant, category
+RT_single_nback_part <- single_nback_df %>% 
+  group_by(participant, stim_type, cognitive_load) %>% 
+  summarise(mean_rt = mean(RT))
+
+(RT_single_1back_raw_boxplot <- ggplot(RT_single_nback[RT_single_nback$cognitive_load == "1-back",], aes(x = stim_type, y = mean_rt, fill = stim_type)) +
+    #geom_bar(aes(), stat = "identity", width = 0.5) +
+    #geom_errorbar(aes(ymin = mean_rt - std.error_rt, ymax = mean_rt + std.error_rt), width =0.07, linewidth=0.7) +
+    geom_boxplot(RT_single_nback_part[RT_single_nback_part$cognitive_load == "1-back",], mapping = aes(x = stim_type, y = mean_rt, fill = stim_type)) +
+    geom_point2(shape = 18, size = 3.5) +
+    geom_line(aes(x = stim_type, y = mean_rt, group=1), color="black", linetype="dotted")+
+    #geom_point2(RT_SF_cond_part, mapping = aes(x = cond, y = mean_rt, group = participant), position = position_jitter(width = 0.2, seed = 42), size = 2.5, alpha = .35) +
+    scale_fill_manual(values = cols_single_nback) +
+    scale_color_manual(values = cols_single_nback) +
+    #scale_y_continuous(breaks = c(1000, 2000, 3000, 4000, 5000, 6000)) +
+    #coord_cartesian(ylim = c(400, 1600)) +
+    ylab("1-back\nReaction Time in ms") +
+    xlab("Stimulation Condition") +
+    theme_bw()+
+    theme(legend.position = "none",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 10),
+         axis.title.x = element_blank(),
+         axis.text.x.bottom = element_text(size = 9.5)) 
+    #facet_wrap(~ block_name, nrow = 2)
+)
+
+(RT_single_2back_raw_boxplot <- ggplot(RT_single_nback[RT_single_nback$cognitive_load == "2-back",], aes(x = stim_type, y = mean_rt, fill = stim_type)) +
+    #geom_bar(aes(), stat = "identity", width = 0.5) +
+    #geom_errorbar(aes(ymin = mean_rt - std.error_rt, ymax = mean_rt + std.error_rt), width =0.07, linewidth=0.7) +
+    geom_boxplot(RT_single_nback_part[RT_single_nback_part$cognitive_load == "2-back",], mapping = aes(x = stim_type, y = mean_rt, fill = stim_type)) +
+    geom_point2(shape = 18, size = 3.5) +
+    geom_line(aes(x = stim_type, y = mean_rt, group=1), color="black", linetype="dotted")+
+    #geom_point2(RT_SF_cond_part, mapping = aes(x = cond, y = mean_rt, group = participant), position = position_jitter(width = 0.2, seed = 42), size = 2.5, alpha = .35) +
+    scale_fill_manual(values = cols_single_nback) +
+    scale_color_manual(values = cols_single_nback) +
+    #scale_y_continuous(breaks = c(1000, 2000, 3000, 4000, 5000, 6000)) +
+    #coord_cartesian(ylim = c(400, 1600)) +
+    ylab("2-back\nReaction Time in ms") +
+    xlab("Stimulation Condition") +
+    theme_bw()+
+    theme(legend.position = "none",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 10),
+         axis.title.x = element_blank(),
+         axis.text.x.bottom = element_text(size = 9.5)) 
+    #facet_wrap(~ block_name, nrow = 2)
+)
+
+(RT_single_1back_raw_violin <- ggplot(RT_single_nback_part[RT_single_nback_part$cognitive_load == "1-back",], aes(x = stim_type, y = mean_rt, fill = stim_type)) +
+    geom_violinhalf(RT_single_nback_part[RT_single_nback_part$stim_type == "Sham" & RT_single_nback_part$cognitive_load == "1-back",], mapping = aes(x = stim_type, y = mean_rt, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_violinhalf(RT_single_nback_part[RT_single_nback_part$stim_type == "Offline"& RT_single_nback_part$cognitive_load == "1-back",], mapping = aes(x = stim_type, y = mean_rt, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_violinhalf(RT_single_nback_part[RT_single_nback_part$stim_type == "Offline + Online" & RT_single_nback_part$cognitive_load == "1-back",], mapping = aes(x = stim_type, y = mean_rt, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_point2(position = position_jitter(width = 0.1, seed = 42), size = 2.5, alpha = .35) +
+    geom_line(mapping = aes(group = participant), color = "#878787", linewidth = 0.2, alpha = 0.55, position = position_jitter(width = 0.1, seed = 42)) +
+    scale_fill_manual(values = cols_single_nback) +
+    scale_color_manual(values = cols_single_nback) +
+    #scale_y_continuous(breaks = c(1000, 2000, 3000, 4000, 5000, 6000), limits = c(1000, 5700)) +
+    #scale_x_discrete(expand = expansion(mult = c(0.1, 0.25))) +
+    coord_cartesian(ylim = c(400, 1600)) +
+    ylab("Reaction Time in ms") +
+    xlab("Stimulation condition") +
+    theme_bw()+
+    theme(legend.position = "none",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 9.5),
+         axis.title.x = element_blank(),
+         axis.text.x.bottom = element_text(size = 9.5))
+    #facet_wrap(~ block_name, nrow = 2)
+)
+
+(RT_single_2back_raw_violin <- ggplot(RT_single_nback_part[RT_single_nback_part$cognitive_load == "2-back",], aes(x = stim_type, y = mean_rt, fill = stim_type)) +
+    geom_violinhalf(RT_single_nback_part[RT_single_nback_part$stim_type == "Sham" & RT_single_nback_part$cognitive_load == "2-back",], mapping = aes(x = stim_type, y = mean_rt, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_violinhalf(RT_single_nback_part[RT_single_nback_part$stim_type == "Offline"& RT_single_nback_part$cognitive_load == "2-back",], mapping = aes(x = stim_type, y = mean_rt, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_violinhalf(RT_single_nback_part[RT_single_nback_part$stim_type == "Offline + Online" & RT_single_nback_part$cognitive_load == "2-back",], mapping = aes(x = stim_type, y = mean_rt, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_point2(position = position_jitter(width = 0.1, seed = 42), size = 2.5, alpha = .35) +
+    geom_line(mapping = aes(group = participant), color = "#878787", linewidth = 0.2, alpha = 0.55, position = position_jitter(width = 0.1, seed = 42)) +
+    scale_fill_manual(values = cols_single_nback) +
+    scale_color_manual(values = cols_single_nback) +
+    #scale_y_continuous(breaks = c(1000, 2000, 3000, 4000, 5000, 6000), limits = c(1000, 5700)) +
+    #scale_x_discrete(expand = expansion(mult = c(0.1, 0.25))) +
+    coord_cartesian(ylim = c(400, 1600)) +
+    ylab("Reaction Time in ms") +
+    xlab("Stimulation condition") +
+    theme_bw()+
+    theme(legend.position = "none",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text = element_text(size = 9.5),
+         axis.title.x = element_blank())
+         #axis.text = element_text(size = 9.5))
+    #facet_wrap(~ block_name, nrow = 2)
+)
+
+# Plot RT across time_from_session by stim_type
+(RT_single_1back_raw_time <- ggplot(single_nback_df[single_nback_df$cognitive_load == "1-back",], aes(x = time_from_onset_session, y = RT, fill = stim_type, color = stim_type)) +
+    geom_point2(alpha = 0.02) +
+    geom_smooth(linewidth = 1.5, method = "gam", formula = y ~ s(x, bs = "cr")) +
+    scale_fill_manual(values = cols_single_nback) +
+    scale_color_manual(values = cols_single_nback) +
+    #scale_y_continuous(breaks = c(1000, 2000, 3000, 4000, 5000, 6000)) +
+    coord_cartesian(ylim = c(200, 1600)) +
+    ylab("Reaction Time in ms") +
+    xlab("Stimulation Condition") +
+    theme_bw()+
+    theme(legend.position = "none",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 9.5),
+         axis.title.x = element_blank(),
+         strip.text = element_blank(),
+         axis.text.x.bottom = element_text(size = 9.5))
+    #facet_wrap(~ cognitive_load, nrow = 2)
+)
+
+(RT_single_2back_raw_time <- ggplot(single_nback_df[single_nback_df$cognitive_load == "2-back",], aes(x = time_from_onset_session, y = RT, fill = stim_type, color = stim_type)) +
+    geom_point2(alpha = 0.02) +
+    geom_smooth(linewidth = 1.5, method = "gam", formula = y ~ s(x, bs = "cr"), ) +
+    scale_fill_manual(values = cols_single_nback) +
+    scale_color_manual(values = cols_single_nback) +
+    #scale_y_continuous(breaks = c(1000, 2000, 3000, 4000, 5000, 6000)) +
+    coord_cartesian(ylim = c(200, 1600)) +
+    ylab("Reaction Time in ms") +
+    xlab("Stimulation Condition") +
+    theme_bw()+
+    theme(legend.position = "bottom",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 9.5),
+         axis.title.x = element_blank(),
+         strip.text = element_blank(),
+         axis.text.x.bottom = element_text(size = 9.5)) +
+    facet_wrap(~ cognitive_load, nrow = 2)
+)
+
+(RT_single_nback_raw <- ggarrange(RT_single_1back_raw_boxplot,
+            RT_single_1back_raw_violin +
+              theme(axis.title.y = element_blank(),
+                    axis.text.y = element_blank(),
+                    axis.ticks.y = element_blank(),
+                    axis.line.y = element_blank()),
+            RT_single_1back_raw_time +
+              theme(axis.title.y = element_blank()),
+            RT_single_2back_raw_boxplot,
+            RT_single_2back_raw_violin +
+              theme(axis.title.y = element_blank(),
+                    axis.text.y = element_blank(),
+                    axis.ticks.y = element_blank(),
+                    axis.line.y = element_blank()),
+            RT_single_2back_raw_time +
+              theme(axis.title.y = element_blank()),
+            heights = c(1,1),
+            #widths = c(0.7,0.55),
+            ncol = 3, nrow = 2)
+)
+
+ggsave(RT_single_nback_raw, file = here::here(paste0("Plots/RT_single_nback_raw_", today, ".png")), width = 210, height = 100, units = "mm")
+
+# Plot online trials only ----
+RT_single_nback <- single_nback_df_online %>% 
+  group_by(stim_type, cognitive_load) %>%
+  summarise(mean_rt = mean(RT),
+            SD_rt = sd(RT),
+            std.error_rt = std.error(RT))
+
+# Summary df by condition, participant, category
+RT_single_nback_part <- single_nback_df_online %>% 
+  group_by(participant, stim_type, cognitive_load) %>% 
+  summarise(mean_rt = mean(RT))
+
+(RT_online_boxplot <- ggplot(RT_single_nback, aes(x = stim_type, y = mean_rt, fill = stim_type)) +
+    geom_boxplot(RT_single_nback_part, mapping = aes(x = stim_type, y = mean_rt, fill = stim_type)) +
+    geom_point2(shape = 18, size = 3.5) +
+    geom_line(aes(x = stim_type, y = mean_rt, group=1), color="black", linetype="dotted")+
+    scale_fill_manual(values = cols_single_nback) +
+    scale_color_manual(values = cols_single_nback) +
+    #scale_y_continuous(breaks = c(1000, 2000, 3000, 4000, 5000, 6000)) +
+    coord_cartesian(ylim = c(450, 1900)) +
+    ylab("Reaction Time in ms") +
+    xlab("Stimulation Condition") +
+    theme_bw()+
+    theme(legend.position = "none",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 10),
+         axis.title.x = element_blank(),
+         axis.text.x.bottom = element_text(size = 9.5)) +
+    facet_wrap(~ cognitive_load)
+)
+
+(RT_online_violin <- ggplot(RT_single_nback_part, aes(x = stim_type, y = mean_rt, fill = stim_type)) +
+    geom_violinhalf(RT_single_nback_part[RT_single_nback_part$stim_type == "Sham",], mapping = aes(x = stim_type, y = mean_rt, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_violinhalf(RT_single_nback_part[RT_single_nback_part$stim_type == "Offline + Online",], mapping = aes(x = stim_type, y = mean_rt, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_point2(position = position_jitter(width = 0.1, seed = 42), size = 2.5, alpha = .35) +
+    geom_line(mapping = aes(group = participant), color = "#878787", linewidth = 0.2, alpha = 0.55, position = position_jitter(width = 0.1, seed = 42)) +
+    scale_fill_manual(values = cols_single_nback) +
+    scale_color_manual(values = cols_single_nback) +
+    scale_x_discrete(expand = expansion(add = c(0.2, 0.8))) +
+    coord_cartesian(ylim = c(450, 1900)) +
+    ylab("Reaction Time in ms") +
+    xlab("Stimulation condition") +
+    theme_bw()+
+    theme(legend.position = "none",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 10),
+         axis.title.x = element_blank(),
+         axis.text.x.bottom = element_text(size = 9.5)) +
+    facet_wrap(~ cognitive_load)
+)
+
+plot_RT_online <- ggarrange(RT_online_boxplot,
+                            RT_online_violin +
+                              theme(axis.title.y = element_blank(),
+                    axis.text.y = element_blank(),
+                    axis.ticks.y = element_blank(),
+                    axis.line.y = element_blank()),
+                    ncol = 2)
+                    
+ggsave(plot_RT_online, file = here::here(paste0("Plots/RT_single_nback_raw_onlineTrials_", today, ".png")), width = 180, height = 80, units = "mm")
+```
+
+### Plot D-prime by Stimulation Condition
+```{r plot single n-back tasks}
+# Remove first trials w/o previous duration
+single_nback_df <- subset(single_nback_df, !is.na(previous_duration))
+
+# Also remove first two blocks of participant 07, session 2, because the experiment had to be re-started in this session
+single_nback_df <- subset(single_nback_df, !(participant == "07" & session == 2)) #& date == "2025-06-04_10h38.32.349"))
+
+# Summary df by condition
+dprime_nback <- single_nback_df %>% 
+  group_by(stim_type, cognitive_load, is_trigger) %>%
+  summarise(mean_dprime = mean(dprime_new),
+            SD_dprime = sd(dprime_new),
+            std.error_dprime = std.error(dprime_new))
+
+# Summary df by condition, participant
+dprime_nback_part <- single_nback_df %>% 
+  group_by(participant, stim_type, cognitive_load, is_trigger) %>% 
+  summarise(mean_dprime = mean(dprime_new))
+
+(dprime_nback_raw_boxplot <- ggplot(dprime_nback, aes(x = stim_type, y = mean_dprime, fill = stim_type)) +
+    geom_boxplot(dprime_nback_part, mapping = aes(x = stim_type, y = mean_dprime, fill = stim_type)) +
+    geom_point2(shape = 18, size = 3.5) +
+    geom_line(aes(x = stim_type, y = mean_dprime, group=1), color="black", linetype="dotted")+
+    scale_fill_manual(values = cols_single_nback) +
+    scale_color_manual(values = cols_single_nback) +
+    #scale_x_discrete(expand = expansion(add = c(0.8, 0.5))) +
+    ylab("N-back task\nD-prime") +
+    xlab("Stimulation Condition") +
+    facet_grid(cognitive_load ~ is_trigger, scales = "free_x", space = "free_x", labeller = labeller(is_trigger = c("False" = "No TMS train", "True" = "With TMS train")),) +
+    theme_bw()+
+    theme(legend.position = "none",
+         strip.background = element_blank(),
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 10),
+         axis.title.x = element_blank(),
+         axis.text.x = element_text(angle = 45, hjust = 1),
+         axis.text.x.bottom = element_text(size = 9.5)) 
+)
+
+(dprime_nback_raw_violin <- ggplot(dprime_nback_part, aes(x = stim_type, y = mean_dprime, fill = stim_type)) +
+    geom_violinhalf(dprime_nback_part[dprime_nback_part$stim_type == "Sham",], mapping = aes(x = stim_type, y = mean_dprime, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_violinhalf(dprime_nback_part[dprime_nback_part$stim_type == "Offline",], mapping = aes(x = stim_type, y = mean_dprime, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_violinhalf(dprime_nback_part[dprime_nback_part$stim_type == "Offline + Online",], mapping = aes(x = stim_type, y = mean_dprime, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_point2(position = position_jitter(width = 0.1, seed = 42), size = 2.5, alpha = .35) +
+    geom_line(mapping = aes(group = participant), color = "#878787", linewidth = 0.2, alpha = 0.55, position = position_jitter(width = 0.1, seed = 42)) +
+    scale_fill_manual(values = cols_single_nback) +
+    scale_color_manual(values = cols_single_nback) +
+    scale_x_discrete(expand = expansion(add = c(0.2, 0.8))) +
+    facet_grid(cognitive_load ~ is_trigger, scales = "free_x", space = "free_x", labeller = labeller(is_trigger = c("False" = "No TMS train", "True" = "With TMS train")),) +
+    ylab("Dprime") +
+    xlab("Stimulation condition") +
+    theme_bw()+
+    theme(legend.position = "none",
+         strip.background = element_blank(),
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 10),
+         axis.title.x = element_blank(),
+         axis.text.x = element_text(angle = 45, hjust = 1),
+         axis.text.x.bottom = element_text(size = 9.5))
+)
+
+(dprime_nback_raw <- ggarrange(dprime_nback_raw_boxplot +
+                                 theme(strip.text.y = element_blank()),
+            dprime_nback_raw_violin +
+              theme(axis.title.y = element_blank(),
+                    axis.text.y = element_blank(),
+                    axis.ticks.y = element_blank(),
+                    axis.line.y = element_blank()),
+            #widths = c(0.7,0.55),
+            nrow = 1)
+)
+
+
+ggsave(dprime_nback_raw, file = here::here(paste0("Plots/Dprime_nback_raw_", today, ".png")), width = 150, height = 120, units = "mm")
+
+# Plot numbers of hits and errors ----
+
+# Summary df by condition, participant
+count_summary_df <- single_nback_df %>%
+  filter(nback_response != "correct rejection") %>%
+  group_by(participant, stim_type, cognitive_load, is_trigger, nback_response) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(stim_type, cognitive_load, is_trigger, nback_response) %>%
+  summarise(
+    mean_count = mean(count),
+    se_count = sd(count) / sqrt(n()),
+    ci_lower = mean_count - qt(0.975, n()-1) * se_count,
+    ci_upper = mean_count + qt(0.975, n()-1) * se_count,
+    .groups = "drop"
+  )
+
+# Plot with error bars
+(nback_acc_nback_task <- ggplot(count_summary_df, aes(x = stim_type, y = mean_count, fill = nback_response)) +
+  geom_col(position = position_dodge(width = 0.9)) +
+  geom_errorbar(aes(ymin = mean_count - se_count, ymax = mean_count + se_count),
+                position = position_dodge(width = 0.9), 
+                width = 0.25) +
+  scale_fill_manual(values = cols_single_nback) +
+  ylab("Mean Count") +
+  xlab("Stimulation Condition") +
+  facet_grid(cognitive_load ~ is_trigger, scales = "free_x", space = "free_x",
+             labeller = labeller(is_trigger = c("False" = "No TMS train", 
+                                                "True" = "With TMS train"))) +
+  theme_bw()+
+    theme(legend.position = "bottom",
+         strip.background = element_blank(),
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 10),
+         axis.title.x = element_blank(),
+         axis.text.x = element_text(angle = 45, hjust = 1),
+         axis.text.x.bottom = element_text(size = 9.5)) 
+)
+
+ggsave(nback_acc_nback_task, file = here::here(paste0("Plots/Nback_acc_nback_raw_", today, ".png")), width = 150, height = 120, units = "mm")
+
+
+
+
+
+single_nback_df_subset <- single_nback_df %>% 
+  select(participant, stim_type, session, cognitive_load, dprime_new, is_trigger, sideEffects_sum, block_nr_exp, RS, executive_sum, education_years, Age, task_onset) %>% 
+  distinct()
+
+# Summary df by condition
+dprime_single_nback <- single_nback_df %>% 
+  group_by(stim_type, block_name) %>%
+  summarise(mean_dprime = mean(dprime),
+            SD_dprime = sd(dprime),
+            std.error_dprime = std.error(dprime))
+
+# Summary df by condition, participant
+dprime_single_nback_part <- single_nback_df %>% 
+  group_by(participant, stim_type, block_name) %>% 
+  summarise(mean_dprime = mean(dprime))
+
+(Acc_single_1back_raw_boxplot <- ggplot(dprime_single_nback[dprime_single_nback$block_name == "1back_single_main_click",], aes(x = stim_type, y = mean_dprime, fill = stim_type)) +
+    #geom_bar(aes(), stat = "identity", width = 0.5) +
+    #geom_errorbar(aes(ymin = mean_rt - std.error_rt, ymax = mean_rt + std.error_rt), width =0.07, linewidth=0.7) +
+    geom_boxplot(dprime_single_nback_part[dprime_single_nback_part$block_name == "1back_single_main_click",], mapping = aes(x = stim_type, y = mean_dprime, fill = stim_type)) +
+    geom_point2(shape = 18, size = 3.5) +
+    geom_line(aes(x = stim_type, y = mean_dprime, group=1), color="black", linetype="dotted")+
+    #geom_point2(RT_SF_cond_part, mapping = aes(x = cond, y = mean_rt, group = participant), position = position_jitter(width = 0.2, seed = 42), size = 2.5, alpha = .35) +
+    scale_fill_manual(values = cols_single_nback) +
+    scale_color_manual(values = cols_single_nback) +
+    #scale_y_continuous(breaks = c(1000, 2000, 3000, 4000, 5000, 6000)) +
+    #coord_cartesian(ylim = c(1000, 5600)) +
+    ylab("1-back\nD-prime") +
+    xlab("Stimulation Condition") +
+    theme_bw()+
+    theme(legend.position = "none",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 10),
+         axis.title.x = element_blank(),
+         axis.text.x.bottom = element_text(size = 9.5)) 
+    #facet_wrap(~ block_name, nrow = 2)
+)
+
+(Acc_single_2back_raw_boxplot <- ggplot(dprime_single_nback[dprime_single_nback$block_name == "2back_single_main_click",], aes(x = stim_type, y = mean_dprime, fill = stim_type)) +
+    #geom_bar(aes(), stat = "identity", width = 0.5) +
+    #geom_errorbar(aes(ymin = mean_rt - std.error_rt, ymax = mean_rt + std.error_rt), width =0.07, linewidth=0.7) +
+    geom_boxplot(dprime_single_nback_part[dprime_single_nback_part$block_name == "2back_single_main_click",], mapping = aes(x = stim_type, y = mean_dprime, fill = stim_type)) +
+    geom_point2(shape = 18, size = 3.5) +
+    geom_line(aes(x = stim_type, y = mean_dprime, group=1), color="black", linetype="dotted")+
+    #geom_point2(RT_SF_cond_part, mapping = aes(x = cond, y = mean_rt, group = participant), position = position_jitter(width = 0.2, seed = 42), size = 2.5, alpha = .35) +
+    scale_fill_manual(values = cols_single_nback) +
+    scale_color_manual(values = cols_single_nback) +
+    #scale_y_continuous(breaks = c(1000, 2000, 3000, 4000, 5000, 6000)) +
+    #coord_cartesian(ylim = c(1000, 5600)) +
+    ylab("2-back\nDprime") +
+    xlab("Stimulation Condition") +
+    theme_bw()+
+    theme(legend.position = "none",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 10),
+         axis.title.x = element_blank(),
+         axis.text.x.bottom = element_text(size = 9.5)) 
+    #facet_wrap(~ block_name, nrow = 2)
+)
+
+(Acc_single_1back_raw_violin <- ggplot(dprime_single_nback_part[dprime_single_nback_part$block_name == "1back_single_main_click",], aes(x = stim_type, y = mean_dprime, fill = stim_type)) +
+    geom_violinhalf(dprime_single_nback_part[dprime_single_nback_part$stim_type == "Sham" & dprime_single_nback_part$block_name == "1back_single_main_click",], mapping = aes(x = stim_type, y = mean_dprime, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_violinhalf(dprime_single_nback_part[dprime_single_nback_part$stim_type == "Offline"& dprime_single_nback_part$block_name == "1back_single_main_click",], mapping = aes(x = stim_type, y = mean_dprime, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_violinhalf(dprime_single_nback_part[dprime_single_nback_part$stim_type == "Offline + Online" & dprime_single_nback_part$block_name == "1back_single_main_click",], mapping = aes(x = stim_type, y = mean_dprime, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_point2(position = position_jitter(width = 0.1, seed = 42), size = 2.5, alpha = .35) +
+    geom_line(mapping = aes(group = participant), color = "#878787", linewidth = 0.2, alpha = 0.55, position = position_jitter(width = 0.1, seed = 42)) +
+    scale_fill_manual(values = cols_single_nback) +
+    scale_color_manual(values = cols_single_nback) +
+    #scale_y_continuous(breaks = c(1000, 2000, 3000, 4000, 5000, 6000), limits = c(1000, 5700)) +
+    #scale_x_discrete(expand = expansion(mult = c(0.1, 0.25))) +
+    #coord_cartesian(ylim = c(1000, 5600)) +
+    ylab("Dprime") +
+    xlab("Stimulation condition") +
+    theme_bw()+
+    theme(legend.position = "none",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 10),
+         axis.title.x = element_blank(),
+         axis.text.x.bottom = element_text(size = 9.5))
+    #facet_wrap(~ block_name, nrow = 2)
+)
+
+(Acc_single_2back_raw_violin <- ggplot(dprime_single_nback_part[dprime_single_nback_part$block_name == "2back_single_main_click",], aes(x = stim_type, y = mean_dprime, fill = stim_type)) +
+    geom_violinhalf(dprime_single_nback_part[dprime_single_nback_part$stim_type == "Sham" & dprime_single_nback_part$block_name == "2back_single_main_click",], mapping = aes(x = stim_type, y = mean_dprime, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_violinhalf(dprime_single_nback_part[dprime_single_nback_part$stim_type == "Offline"& dprime_single_nback_part$block_name == "2back_single_main_click",], mapping = aes(x = stim_type, y = mean_dprime, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_violinhalf(dprime_single_nback_part[dprime_single_nback_part$stim_type == "Offline + Online" & dprime_single_nback_part$block_name == "2back_single_main_click",], mapping = aes(x = stim_type, y = mean_dprime, group = stim_type, fill = stim_type), alpha = 1, color = NA, trim = TRUE, flip = F, position = position_nudge(x = .25)) +
+    geom_point2(position = position_jitter(width = 0.1, seed = 42), size = 2.5, alpha = .35) +
+    geom_line(mapping = aes(group = participant), color = "#878787", linewidth = 0.2, alpha = 0.55, position = position_jitter(width = 0.1, seed = 42)) +
+    scale_fill_manual(values = cols_single_nback) +
+    scale_color_manual(values = cols_single_nback) +
+    #scale_y_continuous(breaks = c(1000, 2000, 3000, 4000, 5000, 6000), limits = c(1000, 5700)) +
+    #scale_x_discrete(expand = expansion(mult = c(0.1, 0.25))) +
+    #coord_cartesian(ylim = c(1000, 5600)) +
+    ylab("Dprime") +
+    xlab("Stimulation condition") +
+    theme_bw()+
+    theme(legend.position = "none",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 10),
+         axis.title.x = element_blank(),
+         axis.text.x.bottom = element_text(size = 9.5))
+    #facet_wrap(~ block_name, nrow = 2)
+)
+
+(Acc_single_nback_raw <- ggarrange(Acc_single_1back_raw_boxplot,
+            Acc_single_1back_raw_violin +
+              theme(axis.title.y = element_blank(),
+                    axis.text.y = element_blank(),
+                    axis.ticks.y = element_blank(),
+                    axis.line.y = element_blank()),
+            Acc_single_2back_raw_boxplot,
+            Acc_single_2back_raw_violin +
+              theme(axis.title.y = element_blank(),
+                    axis.text.y = element_blank(),
+                    axis.ticks.y = element_blank(),
+                    axis.line.y = element_blank()),
+            heights = c(1,1),
+            #widths = c(0.7,0.55),
+            ncol = 2, nrow = 2)
+)
+
+ggsave(Acc_single_nback_raw, file = here::here(paste0("Plots/Acc_single_nback_raw_", today, ".png")), width = 150, height = 110, units = "mm")
+```
+
+## Reaction time analysis
+```{r}
+# look at RT
+hist(log(single_nback_df$RT))
+hist(single_nback_df$RT)
+fitdistrplus::descdist(single_nback_df$RT)
+fitdistrplus::descdist(log(single_nback_df$RT))
+
+# For statistical models, remove first trials w/o previous duration
+single_nback_df <- subset(single_nback_df, !is.na(previous_duration))
+single_nback_df <- subset(single_nback_df, RT > 100)
+
+# Also remove first two blocks of participant 07, session 2, because the experiment had to be re-started in this session
+single_nback_df <- subset(single_nback_df, !(participant == "07" & session == 2)) #& date == "2025-06-04_10h38.32.349"))
+
+# LMM ----
+lmm_RT_single_nback <- lmer(log(RT) ~
+                         stim_type +
+                         session +
+                         cognitive_load +
+                         reaction +
+                         previous_reaction + # 
+                         target + # 
+                         prev_target + # 
+                         nback_acc + # 
+                         is_trigger +
+                         scale(task_onset, scale = FALSE) +
+                         scale(trial_nr, scale = FALSE) + # slope no
+                         scale(time_from_onset_nback, scale = FALSE) +
+                         scale(RS, scale = FALSE) +
+                         scale(executive_sum, scale = FALSE) +
+                         scale(education_years, scale = FALSE) +
+                         scale(Age, scale = FALSE) +
+                         scale(sideEffects_sum, scale = FALSE) +
+                         scale(log(previous_duration), scale = TRUE) +
+                         #efield_AG +
+                         #efield_DLPFC +  
+                         cognitive_load:stim_type +
+                         reaction:stim_type +
+                         nback_acc:stim_type +
+                         nback_acc:stim_type:cognitive_load +   
+                         scale(task_onset, scale = FALSE):stim_type +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type:cognitive_load +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type:scale(task_onset, scale = FALSE) +
+                         (1 + stim_type * cognitive_load + reaction | participant),
+                       data = single_nback_df,
+                       REML = FALSE,
+                       control = lmerControl(optimizer = "bobyqa")
+)
+check_model(lmm_RT_single_nback)
+summary(lmm_RT_single_nback)
+Anova(lmm_RT_single_nback)
+
+plot(predict_response(lmm_RT_single_nback, c("time_from_onset_nback", "stim_type", "task_onset"), margin = "marginalmeans", rg.limit = 1000000), limit_range = T)
+
+
+# GAMM ----
+single_nback_df <- single_nback_df %>% 
+  mutate(across(where(is.character), as.factor))
+gamm4_RT_single_nback <- gamm4(log(RT) ~
+                        cognitive_load +
+                        stim_type +
+                        session +
+                        reaction +
+                        previous_reaction +
+                        is_trigger +
+                        cognitive_load : stim_type +
+                        s(trigger_per_block_centered) + 
+                        s(trial_nr) +
+                        s(time_from_onset_session) +
+                        s(education_years, k = 6) +
+                        s(Age) +
+                        s(sideEffects_sum) +
+                        s(mean_dprime_singletasks) + 
+                        s(previous_duration) +
+                        s(time_from_onset_session, by = stim_type), 
+                        random = ~ (1 + cognitive_load * stim_type | participant),
+                      data = single_nback_df, 
+                      REML = FALSE,
+                      control = lmerControl(optimizer = "bobyqa")
+)
+saveRDS(gamm4_RT_single_nback, file = here::here("RData/models/gamm4_RT_single_nback.rds"))
+
+# try with bam
+gamm_RT_single_nback <- bam(log(RT) ~
+                        cognitive_load +
+                        stim_type +
+                        session +
+                        reaction +
+                        previous_reaction +
+                        is_trigger +
+                        cognitive_load:stim_type +
+                        s(trigger_per_block_centered) + 
+                        s(trial_nr) +
+                        s(time_from_onset_session) +
+                        s(education_years, k = 6) +
+                        s(Age) +
+                        s(sideEffects_sum) +
+                        s(mean_dprime_singletasks) + 
+                        s(previous_duration) +
+                        s(time_from_onset_session, by = stim_type) +
+                        s(time_from_onset_session, participant, bs = "fs", by = stim_type),
+                      data = single_nback_df, 
+                      REML = FALSE,
+)
+saveRDS(gamm_RT_single_nback, file = here::here("RData/models/gamm_RT_single_nback.rds"))
+gam.check(gamm_RT_single_nback)
+AIC(lmm4_RT_single_nback, gamm_RT_single_nback)
+
+
+# ONLINE TRIALS ONLY (Separate analysis for online trials) ----
+single_nback_df_online <- subset(single_nback_df, is_trigger == "True")
+single_nback_df_online <- droplevels(single_nback_df_online)
+
+# new contrast coding for stim type since we're loosing one level
+c <- contr.treatment(2) 
+my.coding <- matrix(rep(1/2, 2), ncol = 1) 
+my.simple <- c-my.coding
+contrasts(single_nback_df_online$stim_type) <- my.simple
+
+### LMM ----
+lmm_RT_single_nback_online <- lmer(log(RT) ~
+                         stim_type +
+                         session +
+                         cognitive_load +
+                         reaction +
+                         previous_reaction + # 
+                         target + # 
+                         prev_target + # 
+                         nback_acc + # 
+                         scale(task_onset, scale = FALSE) +
+                         scale(trial_nr, scale = FALSE) + # slope no
+                         scale(time_from_onset_nback, scale = FALSE) +
+                         scale(RS, scale = FALSE) +
+                         scale(executive_sum, scale = FALSE) +
+                         scale(education_years, scale = FALSE) +
+                         scale(Age, scale = FALSE) +
+                         scale(sideEffects_sum, scale = FALSE) +
+                         scale(log(previous_duration), scale = TRUE) +
+                         cognitive_load:stim_type +
+                         reaction:stim_type +
+                         nback_acc:stim_type +
+                         # nback_acc:stim_type:cognitive_load + # VIF too high
+                         scale(task_onset, scale = FALSE):stim_type +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type:cognitive_load +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type:scale(task_onset, scale = FALSE) +
+                         (1 + stim_type * cognitive_load + reaction | participant),
+                       data = single_nback_df_online,
+                       REML = FALSE,
+                       control = lmerControl(optimizer = "bobyqa")
+)
+check_model(lmm_RT_single_nback_online)
+summary(lmm_RT_single_nback_online)
+Anova(lmm_RT_single_nback_online)
+
+plot(predict_response(lmm_RT_single_nback_online, c("stim_type", "cognitive_load"), margin = "marginalmeeans"))
+
+# GAMM ----
+single_nback_df <- single_nback_df %>% 
+  mutate(across(where(is.character), as.factor))
+
+gamm1_RT_single_nback <- bam(RT ~
+                  stim_type +
+                  session +
+                  cognitive_load +
+                  reaction +
+                  is_trigger +
+                  cognitive_load : stim_type +
+                  s(trigger_per_block) + 
+                  s(trial_nr) +
+                  s(time_from_onset_session) +
+                  s(education_years, k = 6) +
+                  s(Age) +
+                  s(sideEffects_sum) +
+                  s(mean_dprime_singletasks) + 
+                  s(previous_duration) +
+                  s(time_from_onset_session, by = stim_type) +
+                  s(participant, by = stim_type:cognitive_load, bs = "re"),
+               data = single_nback_df,
+               family = Gamma(link = "log"),
+               discrete = FALSE,
+               method = "REML",
+               nthreads = 16
+)
+
+
+# BRM ----
+brms_RT_single_nback <- brm(RT ~ 
+       stim_type +
+       session +
+       cognitive_load +
+       reaction +
+       is_trigger +
+       scale(trigger_per_block, scale = FALSE) +
+       scale(trial_nr, scale = FALSE) +
+       scale(time_from_onset_session, scale = FALSE) +
+       scale(education_years, scale = FALSE) +
+       scale(Age, scale = FALSE) +
+       scale(sideEffects_sum, scale = FALSE) +
+       scale(mean_dprime_singletasks, scale = TRUE) +
+       scale(previous_duration, scale = TRUE) +
+       cognitive_load:stim_type +
+       scale(time_from_onset_session, scale = FALSE):stim_type +
+       (1 + stim_type * cognitive_load | participant),
+  data = single_nback_df,
+  family = Gamma(link = "log"),
+  iter = 4000, # total iterations per chain
+  warmup = 2000, # warmup (burn-in) iterations per chain
+  chains = 5, # number of chains (default is 4)
+  threads = threading(6),
+  backend = "cmdstanr",
+  inits = 0
+)
+
+bayes_lmm <- brm(log(RT) ~
+                         stim_type +
+                         session +
+                         cognitive_load +
+                         reaction +
+                         previous_reaction + # 
+                         target + # 
+                         prev_target + # 
+                         nback_acc + # 
+                         is_trigger +
+                         scale(task_onset, scale = FALSE) +
+                         scale(trial_nr, scale = FALSE) + # slope no
+                         scale(time_from_onset_nback, scale = FALSE) +
+                         scale(RS, scale = FALSE) +
+                         scale(executive_sum, scale = FALSE) +
+                         scale(education_years, scale = FALSE) +
+                         scale(Age, scale = FALSE) +
+                         scale(sideEffects_sum, scale = FALSE) +
+                         scale(log(previous_duration), scale = TRUE) +
+                         cognitive_load:stim_type +
+                         reaction:stim_type +
+                         nback_acc:stim_type +
+                         nback_acc:stim_type:cognitive_load +   
+                         scale(task_onset, scale = FALSE):stim_type +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type:cognitive_load +
+                         scale(time_from_onset_nback, scale = FALSE):stim_type:scale(task_onset, scale = FALSE) +
+                         (1 + stim_type * cognitive_load + reaction | participant),
+                       data = single_nback_df)
+
+```
+
+## D-prime analysis
+```{r}
+# Re-calculate d-prime: separate d-prime for trials with online stimulation and not (makes 2 d-prime values per text)
+single_nback_df <- single_nback_df %>% 
+  group_by(participant, stim_type, block_nr_exp, is_trigger) %>% 
+  mutate(dprime_new = get_dprime(nback_response))
+
+single_nback_df_subset <- single_nback_df %>% 
+  select(participant, stim_type, session, cognitive_load, dprime_new, is_trigger, sideEffects_sum, block_nr_exp, RS, executive_sum, education_years, Age, task_onset) %>% 
+  distinct()
+
+lmm_single_nback_dprime <- lmerTest::lmer(dprime_new ~
+    stim_type +
+    cognitive_load +
+    is_trigger +
+    session +
+    scale(block_nr_exp, scale = FALSE) +
+    scale(education_years, scale = FALSE) +
+    scale(Age, scale = FALSE) +
+    scale(executive_sum, scale = FALSE) +
+    scale(RS, scale = FALSE) +
+    scale(sideEffects_sum, scale = FALSE) +
+    is_trigger:cognitive_load +
+    stim_type:cognitive_load +
+    (1 + cognitive_load | participant),
+  data = single_nback_df_subset, 
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa")
+)
+check_model(lmm_single_nback_dprime)
+summary(lmm_single_nback_dprime)
+Anova(lmm_single_nback_dprime)
+
+plot(predict_response(lmm_single_nback_dprime, "stim_type", margin = "marginalmeans"))
+plot(predict_response(lmm_single_nback_dprime, "is_trigger", margin = "marginalmeans"))
+plot(predict_response(lmm_single_nback_dprime, c("cognitive_load", "is_trigger"), margin = "marginalmeans"))
+
+# model only with online trials to explore interaction of stim type and trigger --> there is no sig interaction and there's also nothing there
+single_nback_df_subset_online <- subset(single_nback_df_subset, stim_type != "Offline")
+single_nback_df_subset_online <- subset(single_nback_df_subset_online, is_trigger != "False")
+single_nback_df_subset_online <- droplevels(single_nback_df_subset_online)
+
+lmm_single_nback_dprime_online <- lmerTest::lmer(dprime_new ~
+    stim_type +
+    cognitive_load +
+    session +
+    scale(block_nr_exp, scale = FALSE) +
+    scale(education_years, scale = FALSE) +
+    scale(Age, scale = FALSE) +
+    scale(executive_sum, scale = FALSE) +
+    scale(RS, scale = FALSE) +
+    scale(sideEffects_sum, scale = FALSE) +
+    stim_type:cognitive_load +
+    (1 + cognitive_load | participant),
+  data = single_nback_df_subset_online, 
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa")
+)
+
+summary(lmm_single_nback_dprime_online)
+
+plot(predict_response(lmm_single_nback_dprime_online, c("stim_type", "cognitive_load"), margin = "marginalmeans"))
+```
+
