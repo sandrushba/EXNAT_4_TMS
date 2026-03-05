@@ -2,3 +2,9 @@
 .Rhistory
 .RData
 .Ruserdata
+.idea
+Efield_simulations/.idea
+Efield_simulations/ROI_*
+Efield_simulations/*.xlsx
+.xlsx
+Efield_simulations/ebrains*
