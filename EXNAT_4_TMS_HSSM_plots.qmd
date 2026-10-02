@@ -1,0 +1,3177 @@
+---
+title: "EXNAT_4_TMS HSSM Plots"
+author: "Sandra Martin"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    code-fold: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r file setup, echo = FALSE}
+rm(list = ls()) # clear environment
+knitr::opts_chunk$set() # set default options for all code blocks in this document
+options(scipen = 999) # don't use scientific notation for very large or small numbers
+n.cores <- max(1, parallel::detectCores() %/% 2, na.rm = T) # Use half of the available cores
+```
+
+# Load packages
+```{r packages, echo = FALSE, message = FALSE, warning = TRUE}
+# Create a list with needed libraries
+pkgs <- c("here",
+          "ggplot2", 
+          "dplyr",
+          "tidyverse", 
+          "tidybayes",
+          "bayestestR",
+          "see", 
+          "gt",
+          "egg") 
+
+# Load each listed library, check if it's already installed
+# and install if necessary
+for (pkg in pkgs){
+  if(!require(pkg, character.only = TRUE)){
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+today <- Sys.Date()
+today <- format(today, format="%y%m%d")
+```
+
+# Load R Data
+```{r}
+# df with individual factor level parameters
+df_indiv_parameters <- readRDS(file = here("RData/HSSM/df_indiv_parameters.rds"))
+df_indiv_parameters_dual_task <- readRDS(file = here("RData/HSSM/df_indiv_parameters_dual_task.rds"))
+```
+
+# Settings for plots
+```{r Theme for plots, echo = FALSE}
+# Custom colour palettes for the plots:
+palet_task_condition <- c("#D2BFE7",
+                      "#977FB2") 
+palet_task_condition_lines <- c("#ad8bd3",
+                      "#7B5EC6") 
+
+
+cols_dual <- c("#408A95", "#064E58", "#9b84b7", "#56476D", "indianred")
+cols_nback <- c("#7AAACE", "#355872", "#FF9644", "#562F00", "#007160") #"#156570","#156570"
+
+cols_nback_indiv_params <- c("#9CD5FF", "#7AAACE", "#355872", "#FFCE99", "#cd9f6c", "#FF9644", "#d2701d", "#562F00", "#330c00", "#609a58", "#007160") 
+cols_dual_indiv_params <- c("#74BDC7", "#408A95", "#064E58", "#d2b9ef", "#9b84b7", "#56476D", "indianred")
+
+# creating a function for std.error
+std.error <- function(x, na.rm = TRUE){sd(x, na.rm = TRUE)/sqrt(length(x[!is.na(x)]))}
+```
+
+# N-BACK HSSM
+```{r}
+# load file with posterior draws
+df_nback <- read.csv(here("Raw_data/HSSM/nback_va_int.csv"), sep = ",")
+
+df_nback <- df_nback %>% 
+  rename("v_stim_type_simp_Offline+Online.task_simp_2back_single_main_click" = "v_stim_type_simp_Offline...Online.task_simp_2back_single_main_click",
+         "v_stim_type_simp_Offline+Online" =  "v_stim_type_simp_Offline...Online",
+         "a_stim_type_simp_Offline+Online.task_simp_2back_single_main_click" = "a_stim_type_simp_Offline...Online.task_simp_2back_single_main_click",
+         "a_stim_type_simp_Offline+Online" =  "a_stim_type_simp_Offline...Online",
+         "a_task_simp_2-back" = "a_task_simp_2back_single_main_click",
+         "v_task_simp_2-back" = "v_task_simp_2back_single_main_click"
+         )
+
+df_long <- df_nback %>% 
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "term",
+    values_to = "value"
+  )
+
+df_long2 <- df_long %>% 
+  mutate(
+    param = if_else(str_starts(term, "v_"), "v",
+             if_else(str_starts(term, "a_"), "a", NA_character_)),
+    effect = case_when(
+      str_detect(term, "session_simp") ~ "session",
+      str_detect(term, "stim_type_simp") ~ "stim_type",
+      str_detect(term, "task_simp") ~ "task",
+      str_detect(term, "is_trigger") ~ "is_trigger",
+      str_detect(term, "time_from_onset_task") ~ "time_from_onset_task",
+      TRUE ~ "other"
+    )
+  ) %>% 
+  filter(!is.na(param))  # keep only v/a parameters
+
+df_long2 <- df_long2 %>% 
+  mutate(
+    label = case_when(
+      effect == "session" ~ str_remove(term, "^[va]_session_simp_"),
+      effect == "stim_type" ~ str_remove(term, "^[va]_stim_type_simp_"),
+      effect == "task" ~ str_remove(term, "^[va]_task_simp_"),
+      effect == "is_trigger" ~ str_remove(term, "^[va]_is_trigger_simp_"),
+      effect == "time_from_onset_task" ~ str_remove(term, "^[va]_"),
+      TRUE ~ term),
+    type = case_when(
+      str_detect(term, "\\.") ~ "interaction",
+      TRUE ~ "main_effect")
+  )
+
+# Recover sham posteriors ----
+# k <- 3
+# df_sham_v <- df_nback %>%
+#   transmute(
+#     chain,
+#     draw,
+#     v_sham = v_Intercept -
+#       (1 / k) * v_stim_type_simp_Offline -
+#       (1 / k) * `v_stim_type_simp_Offline+Online`)
+# test <- full_join(df_nback, df_sham_v)
+
+```
+
+## Drift rate: Plotting posterior distributions
+```{r}
+df_v <- df_long2 %>% 
+  filter(param == "v")
+
+# compute summary stats (95% HDI, mean HDI) 
+summary_v <- df_v %>% 
+  group_by(effect, type, label) %>% 
+  summarise(
+    mean = mean(value),
+    hdi_obj = list(bayestestR::hdi(value, ci = 0.95)),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    hdi_low  = map_dbl(hdi_obj, ~ .x$CI_low),
+    hdi_high = map_dbl(hdi_obj, ~ .x$CI_high),
+    annot = sprintf("M = %.2f [%.2f, %.2f]", mean, hdi_low, hdi_high)
+  ) %>% 
+  select(-hdi_obj)
+
+# TMS and TASK ----
+stimType_order = c("Offline", "Offline+Online", "Offline.task_simp_2back_single_main_click", "Offline+Online.task_simp_2back_single_main_click")
+
+# subset for stim_type
+df_v_stimType <- subset(df_v, effect == "stim_type")
+df_v_stimType$label <- factor(df_v_stimType$label, levels = stimType_order, labels = c("Offline TMS", "Offline+Online TMS", "Offline TMS: 2-back task", "Offline+Online TMS: 2-back task"))
+df_v_stimType$type <- factor(df_v_stimType$type, levels = c("main_effect", "interaction"), labels = c("Main effect TMS", "Interaction TMS x Task"))
+
+# subset for task
+df_v_task <- subset(df_v, effect == "task")
+df_v_task$label <- factor(df_v_task$label, labels = "2-back task")
+df_v_task$type <- factor(
+  df_v_task$type, 
+  levels = "main_effect", 
+  labels = "Main effect Task"
+)
+
+# combined df for plotting
+df_v_combined <- bind_rows(df_v_stimType, df_v_task)
+df_v_combined$type <- factor(df_v_combined$type, levels = c("Main effect TMS", "Main effect Task", "Interaction TMS x Task"))
+
+# subset summary stats
+
+# determine max density value for plotting
+# dens_peaks <- df_v %>%
+#   group_by(label, type) %>%
+#   summarise(
+#     max_density = max(density(value)$y),  # compute density on value
+#     .groups = "drop"
+#   )
+
+summary_v_stimType <- subset(summary_v, effect == "stim_type")
+#summary_v_stimType <- left_join(summary_v_stimType, dens_peaks)
+summary_v_stimType$label <- factor(summary_v_stimType$label, levels = stimType_order, labels = c("Offline TMS", "Offline+Online TMS", "Offline TMS: 2-back task", "Offline+Online TMS: 2-back task"))
+summary_v_stimType$type <- factor(summary_v_stimType$type, levels = c("main_effect", "interaction"), labels = c("Main effect TMS", "Interaction TMS x Task"))
+
+summary_v_stimType <- summary_v_stimType %>% 
+  mutate(x_label = case_when(
+    label == "Offline TMS" ~ -0.25,
+    label == "Offline+Online TMS" ~ 0.15,
+    label == "Offline TMS" ~ 0.25,
+    label == "Offline+Online TMS: 2-back task" ~ 0.25,
+    label == "Offline TMS: 2-back task" ~ -0.15,
+    TRUE ~ mean
+  ))
+
+summary_v_stimType$y_seg <- -0.045  # baseline
+summary_v_stimType$y_seg[str_detect(summary_v_stimType$label, "Online")] <- -0.075
+
+# task summary
+summary_v_task <- subset(summary_v, effect == "task")
+#summary_v_task <- summary_v_task %>% 
+#  left_join(dens_peaks)
+summary_v_task$label <- factor(summary_v_task$label, labels = "2-back task")
+summary_v_task$type  <- factor(summary_v_task$type, 
+                               levels = "main_effect", 
+                               labels = "Main effect Task")
+
+summary_v_task$x_label <- summary_v_task$mean
+summary_v_task$y_seg   <- -0.06
+
+# combined summary for plotting
+summary_v_combined <- bind_rows(summary_v_stimType, summary_v_task)
+summary_v_combined$type <- factor(summary_v_combined$type, levels = c("Main effect TMS", "Main effect Task", "Interaction TMS x Task"))
+
+## PLOT ----
+# quick hack: compute max scaled height per label x type directly from ggplot’s stat
+(nback_v_TMS_task <- ggplot(df_v_combined, aes(x = value, fill = label, color = label)) +
+  geom_segment(aes(x = 0, xend = 0, y = -0.075, yend = 1), linetype = "dashed", color = "darkslategrey", ) + 
+  geom_density(aes(y = after_stat(scaled)), alpha = 0.6, colour = NA) +
+  # mean line
+  geom_segment(data = summary_v_combined, aes(x = mean, xend = mean, y = 0, yend = 1, color = label), linetype = "dashed", linewidth = .6, show.legend = FALSE) +
+  # 95% HDI bar on baseline
+  geom_segment(data = summary_v_combined, aes(x = hdi_low, xend = hdi_high, y = y_seg, yend = y_seg, color = label), linewidth = 1.1, inherit.aes = FALSE) +
+  # facet labels with mean + HDI
+  geom_text(data = summary_v_combined, aes(x = x_label, y = Inf, label = annot, color = label), vjust = 1.1, size = 2.5, show.legend = FALSE) +
+  scale_y_continuous(limits = c(-0.075, 1.1)) +
+  facet_wrap(~ type, scales = "free_x") +
+  labs(x = "Effect on drift v", y = "Posterior density") +
+  scale_color_manual(values = cols_nback) +
+  scale_fill_manual(values = cols_nback) +
+  theme_minimal(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    #axis.text.y = element_text(size = 8.5),
+    axis.text.x.bottom = element_text(size = 8.5))
+)
+
+ggsave(nback_v_TMS_task, file = here("Plots/HSSM/nback_v_TMS_task.pdf"), width = 135, height = 55, units = "mm")
+
+
+# Other effects ----
+df_v_other <- subset(df_v, effect != "stim_type" & effect != "task" & type == "main_effect" & effect != "other")
+df_v_other <- df_v_other %>% 
+  mutate(type = case_when(
+    effect == "is_trigger" ~ "Main effect Trigger",
+    effect == "session" ~ "Main effect Session",
+    effect == "time_from_onset_task" ~ "Main effect Time"
+  ))
+
+summary_v_other <- subset(summary_v, effect != "stim_type" & effect != "task" & type == "main_effect" & effect != "other")
+
+# # determine max density value for plotting
+# dens_peaks <- df_v_other %>%
+#   group_by(label, type) %>%
+#   summarise(
+#     max_density = max(density(value)$y),  # compute density on value
+#     .groups = "drop"
+#   )
+
+summary_v_other <- summary_v_other %>% 
+  mutate(
+    type = case_when(
+      effect == "is_trigger" ~ "Main effect Trigger",
+      effect == "session" ~ "Main effect Session",
+      effect == "time_from_onset_task" ~ "Main effect Time")) %>% 
+  #left_join(dens_peaks, by = c("label", "type")) %>% 
+  mutate(
+    y_seg = case_when(
+      str_detect(label, "2") ~ -0.045,
+      str_detect(label, "3") ~ -0.075,
+      TRUE ~ -0.06
+    ),
+    x_label = case_when(
+      label == "2" ~ 0.1,
+      label == "3" ~ 0.45,
+      TRUE ~ mean
+    )
+  )
+
+## PLOT ----
+(nback_v_other_effects <- ggplot(subset(df_v_other, effect != "session"), aes(x = value, fill = label, color = label)) +
+  geom_segment(aes(x = 0, xend = 0, y = -0.075, yend = 1), linetype = "dashed", color = "darkslategrey", ) + 
+  geom_density(aes(y = after_stat(scaled)), alpha = 0.6, colour = NA) +
+  # mean line
+  geom_segment(data = subset(summary_v_other, effect != "session"), aes(x = mean, xend = mean, y = 0, yend = 1, color = label), linetype = "dashed", linewidth = .6, show.legend = FALSE) +
+  # 95% HDI bar on baseline
+  geom_segment(data = subset(summary_v_other, effect != "session"), aes(x = hdi_low, xend = hdi_high, y = y_seg, yend = y_seg, color = label), linewidth = 1.1, inherit.aes = FALSE) +
+  # facet labels with mean + HDI
+  geom_text(data = subset(summary_v_other, effect != "session"), aes(x = x_label, y = Inf, label = annot, color = label), vjust = 1.1, size = 2.5, show.legend = FALSE) +
+  scale_y_continuous(limits = c(-0.075, 1.1)) +
+  facet_wrap(~ type, scales = "free_x") +
+  labs(x = "Effect on drift v", y = "Posterior density") +
+  scale_color_manual(values = c(rep("slategray",2))) + 
+  scale_fill_manual(values = c(rep("slategray",2))) +
+  #scale_color_manual(values = c("tomato3", "indianred1", "grey62", "grey62")) +
+  #scale_fill_manual(values = c("tomato3", "indianred1", "grey62", "grey62")) +
+  theme_minimal(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    #axis.text.y = element_text(size = 8.5),
+    axis.text.x.bottom = element_text(size = 8.5))
+)
+
+ggsave(nback_v_other_effects, file = here("Plots/HSSM/nback_v_other_effects.pdf"), width = 90, height = 55, units = "mm")
+
+# session
+(nback_v_session <- ggplot(subset(df_v_other, effect == "session"), aes(x = value, fill = label, color = label)) +
+  geom_segment(aes(x = 0, xend = 0, y = -0.075, yend = 1), linetype = "dashed", color = "darkslategrey", ) + 
+  geom_density(aes(y = after_stat(scaled)), alpha = 0.6, colour = NA) +
+  # mean line
+  geom_segment(data = subset(summary_v_other, effect == "session"), aes(x = mean, xend = mean, y = 0, yend = 1, color = label), linetype = "dashed", linewidth = .6, show.legend = FALSE) +
+  # 95% HDI bar on baseline
+  geom_segment(data = subset(summary_v_other, effect == "session"), aes(x = hdi_low, xend = hdi_high, y = y_seg, yend = y_seg, color = label), linewidth = 1.1, inherit.aes = FALSE) +
+  # facet labels with mean + HDI
+  geom_text(data = subset(summary_v_other, effect == "session"), aes(x = x_label, y = Inf, label = annot, color = label), vjust = 1.1, size = 2.5, show.legend = FALSE) +
+  scale_y_continuous(limits = c(-0.075, 1.1)) +
+  facet_wrap(~ type, scales = "free_x") +
+  labs(x = "Effect on drift v", y = "Posterior density") +
+  scale_color_manual(values = c("gray75","gray55")) + 
+  scale_fill_manual(values = c("gray75","gray55")) +
+  #scale_color_manual(values = c("tomato3", "indianred1", "grey62", "grey62")) +
+  #scale_fill_manual(values = c("tomato3", "indianred1", "grey62", "grey62")) +
+  theme_minimal(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    #axis.text.y = element_text(size = 8.5),
+    axis.text.x.bottom = element_text(size = 8.5))
+)
+ggsave(nback_v_session, file = here("Plots/HSSM/nback_v_session.pdf"), width = 45, height = 55, units = "mm")
+
+
+#----------
+df_simple <- df_nback %>%
+  mutate(
+    off_vs_sham_task_1back  = `v_stim_type_simp_Offline` +
+      -0.5  * `v_stim_type_simp_Offline.task_simp_2back_single_main_click`,
+    off_vs_sham_task_2back = `v_stim_type_simp_Offline` +
+      0.5 * `v_stim_type_simp_Offline.task_simp_2back_single_main_click`,
+
+    onoff_vs_sham_task_1back  = `v_stim_type_simp_Offline+Online` +
+      -0.5  * `v_stim_type_simp_Offline+Online.task_simp_2back_single_main_click`,
+    onoff_vs_sham_task_2back = `v_stim_type_simp_Offline+Online` +
+      0.5 * `v_stim_type_simp_Offline+Online.task_simp_2back_single_main_click`
+  )
+
+df_simple_long <- df_simple %>%
+  pivot_longer(
+    cols = c(off_vs_sham_task_1back, off_vs_sham_task_2back,
+             onoff_vs_sham_task_1back, onoff_vs_sham_task_2back),
+    names_to = "term", values_to = "value"
+  ) %>%
+  mutate(
+    tms = if_else(str_starts(term, "off_vs_sham"), "Offline vs Sham", "Offline+Online vs Sham"),
+    task = if_else(str_detect(term, "task_1back"), "1-back", "2-back")
+  )
+
+summary_simple <- df_simple_long %>%
+  group_by(tms, task) %>%
+  summarise(
+    mean = mean(value),
+    hdi_obj = list(bayestestR::hdi(value, ci = 0.95)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    hdi_low  = map_dbl(hdi_obj, ~ .x$CI_low),
+    hdi_high = map_dbl(hdi_obj, ~ .x$CI_high),
+    p_gt_0 = map_dbl(hdi_obj, ~ NA_real_),  # placeholder, computed below
+    annot = sprintf("M = %.2f [%.2f, %.2f]", mean, hdi_low, hdi_high)
+  ) %>%
+  select(-hdi_obj)
+
+# posterior probabilities per condition
+p_summary <- df_simple_long %>%
+  group_by(tms, task) %>%
+  summarise(p_gt_0 = mean(value > 0), p_lt_0 = mean(value < 0), .groups = "drop")
+
+summary_simple <- summary_simple %>% select(-p_gt_0) %>% left_join(p_summary, by = c("tms","task"))
+
+ggplot(df_simple_long, aes(x = value, fill = task, color = task)) +
+  geom_density(alpha = 0.6, colour = NA) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_segment(data = summary_simple,
+               aes(x = mean, xend = mean, y = 0, yend = 1, color = task),
+               linetype = "dashed", linewidth = 0.6, inherit.aes = FALSE) +
+  geom_segment(data = summary_simple,
+               aes(x = hdi_low, xend = hdi_high, y = -0.05, yend = -0.05, color = task),
+               linewidth = 1.1, inherit.aes = FALSE) +
+  geom_text(data = summary_simple,
+            aes(x = mean, y = Inf, label = annot, color = task),
+            vjust = 1.1, size = 2.5, show.legend = FALSE) +
+  facet_wrap(~ tms, scales = "free_x") +
+  theme_minimal(base_size = 9.5) +
+  theme(legend.position = "bottom")
+```
+
+## Boundary separation: Plotting posterior distributions
+```{r}
+df_a <- df_long2 %>% 
+  filter(param == "a")
+
+# compute summary stats (95% HDI, mean HDI) 
+summary_a <- df_a %>% 
+  group_by(effect, type, label) %>% 
+  summarise(
+    mean = mean(value),
+    hdi_obj = list(bayestestR::hdi(value, ci = 0.95)),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    hdi_low  = map_dbl(hdi_obj, ~ .x$CI_low),
+    hdi_high = map_dbl(hdi_obj, ~ .x$CI_high),
+    annot = sprintf("M = %.2f [%.2f, %.2f]", mean, hdi_low, hdi_high)
+  ) %>% 
+  select(-hdi_obj)
+
+# TMS and TASK ----
+stimType_order = c("Offline", "Offline+Online", "Offline.task_simp_2back_single_main_click", "Offline+Online.task_simp_2back_single_main_click")
+
+# subset for stim_type
+df_a_stimType <- subset(df_a, effect == "stim_type")
+df_a_stimType$label <- factor(df_a_stimType$label, levels = stimType_order, labels = c("Offline TMS", "Offline+Online TMS", "Offline TMS: 2-back task", "Offline+Online TMS: 2-back task"))
+df_a_stimType$type <- factor(df_a_stimType$type, levels = c("main_effect", "interaction"), labels = c("Main effect TMS", "Interaction TMS x Task"))
+
+# subset for task
+df_a_task <- subset(df_a, effect == "task")
+df_a_task$label <- factor(df_a_task$label, labels = "2-back task")
+df_a_task$type <- factor(
+  df_a_task$type, 
+  levels = "main_effect", 
+  labels = "Main effect Task"
+)
+
+# combined df for plotting
+df_a_combined <- bind_rows(df_a_stimType, df_a_task)
+df_a_combined$type <- factor(df_a_combined$type, levels = c("Main effect TMS", "Main effect Task", "Interaction TMS x Task"))
+
+# subset summary stats
+
+# determine max density value for plotting
+# dens_peaks <- df_a %>%
+#   group_by(label, type) %>%
+#   summarise(
+#     max_density = max(density(value)$y),  # compute density on value
+#     .groups = "drop"
+#   )
+
+summary_a_stimType <- subset(summary_a, effect == "stim_type")
+#summary_a_stimType <- left_join(summary_a_stimType, dens_peaks)
+summary_a_stimType$label <- factor(summary_a_stimType$label, levels = stimType_order, labels = c("Offline TMS", "Offline+Online TMS", "Offline TMS: 2-back task", "Offline+Online TMS: 2-back task"))
+summary_a_stimType$type <- factor(summary_a_stimType$type, levels = c("main_effect", "interaction"), labels = c("Main effect TMS", "Interaction TMS x Task"))
+
+summary_a_stimType <- summary_a_stimType %>% 
+  mutate(x_label = case_when(
+    label == "Offline TMS" ~ 0.06,
+    label == "Offline+Online TMS" ~ -0.12,
+    label == "Offline+Online TMS: 2-back task" ~ 0.08,
+    label == "Offline TMS: 2-back task" ~ 0,
+    TRUE ~ mean
+  ))
+
+summary_a_stimType$y_seg <- -0.045  # baseline
+summary_a_stimType$y_seg[str_detect(summary_a_stimType$label, "Online")] <- -0.075
+
+# task summary
+summary_a_task <- subset(summary_a, effect == "task")
+#summary_a_task <- summary_a_task %>% 
+#  left_join(dens_peaks)
+summary_a_task$label <- factor(summary_a_task$label, labels = "2-back task")
+summary_a_task$type  <- factor(summary_a_task$type, 
+                               levels = "main_effect", 
+                               labels = "Main effect Task")
+
+summary_a_task$x_label <- summary_a_task$mean
+summary_a_task$y_seg   <- -0.06
+
+# combined summary for plotting
+summary_a_combined <- bind_rows(summary_a_stimType, summary_a_task)
+summary_a_combined$type <- factor(summary_a_combined$type, levels = c("Main effect TMS", "Main effect Task", "Interaction TMS x Task"))
+
+## PLOT ----
+(nback_a_TMS_task <- ggplot(df_a_combined, aes(x = value, fill = label, color = label)) +
+  geom_segment(aes(x = 0, xend = 0, y = -0.075, yend = 1), linetype = "dashed", color = "darkslategrey", ) + 
+  geom_density(aes(y = after_stat(scaled)), alpha = 0.6, colour = NA) +
+  # mean line
+  geom_segment(data = summary_a_combined, aes(x = mean, xend = mean, y = 0, yend = 1, color = label), linetype = "dashed", linewidth = .6, show.legend = FALSE) +
+  # 95% HDI bar on baseline
+  geom_segment(data = summary_a_combined, aes(x = hdi_low, xend = hdi_high, y = y_seg, yend = y_seg, color = label), linewidth = 1.1, inherit.aes = FALSE) +
+  # facet labels with mean + HDI
+  geom_text(data = summary_a_combined, aes(x = x_label, y = Inf, label = annot, color = label), vjust = 1.1, size = 2.5, show.legend = FALSE) +
+  scale_y_continuous(limits = c(-0.075, 1.1)) +
+  facet_wrap(~ type, scales = "free_x") +
+  labs(x = "Effect on boundary threshold a", y = "Posterior density") +
+  scale_color_manual(values = cols_nback) +
+  scale_fill_manual(values = cols_nback) +
+  theme_minimal(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    #axis.text.y = element_text(size = 8.5),
+    axis.text.x.bottom = element_text(size = 8.5))
+)
+
+ggsave(nback_a_TMS_task, file = here("Plots/HSSM/nback_a_TMS_task.pdf"), width = 135, height = 55, units = "mm")
+
+# Other effects ----
+df_a_other <- subset(df_a, effect != "stim_type" & effect != "task" & type == "main_effect" & effect != "other")
+df_a_other <- df_a_other %>% 
+  mutate(type = case_when(
+    effect == "is_trigger" ~ "Main effect Trigger",
+    effect == "session" ~ "Main effect Session",
+    effect == "time_from_onset_task" ~ "Main effect Time"
+  ))
+
+summary_a_other <- subset(summary_a, effect != "stim_type" & effect != "task" & type == "main_effect" & effect != "other")
+
+# determine max density value for plotting
+# dens_peaks <- df_a_other %>%
+#   group_by(label, type) %>%
+#   summarise(
+#     max_density = max(density(value)$y),  # compute density on value
+#     .groups = "drop"
+#   )
+
+summary_a_other <- summary_a_other %>% 
+  mutate(
+    type = case_when(
+      effect == "is_trigger" ~ "Main effect Trigger",
+      effect == "session" ~ "Main effect Session",
+      effect == "time_from_onset_task" ~ "Main effect Time")) %>% 
+  #left_join(dens_peaks, by = c("label", "type")) %>% 
+  mutate(
+    y_seg = case_when(
+      str_detect(label, "2") ~ -0.045,
+      str_detect(label, "3") ~ -0.075,
+      TRUE ~ -0.06
+    ),
+    x_label = case_when(
+      label == "2" ~ -0.23,
+      label == "3" ~ -0.04,
+      TRUE ~ mean
+    )
+  )
+
+## PLOT ----
+(nback_a_other_effects <- ggplot(subset(df_a_other, effect != "session"), aes(x = value, fill = label, color = label)) +
+  geom_segment(aes(x = 0, xend = 0, y = -0.075, yend = 1), linetype = "dashed", color = "darkslategrey", ) + 
+  geom_density(aes(y = after_stat(scaled)), alpha = 0.6, colour = NA) +
+  # mean line
+  geom_segment(data = subset(summary_a_other, effect != "session"), aes(x = mean, xend = mean, y = 0, yend = 1, color = label), linetype = "dashed", linewidth = .6, show.legend = FALSE) +
+  # 95% HDI bar on baseline
+  geom_segment(data = subset(summary_a_other, effect != "session"), aes(x = hdi_low, xend = hdi_high, y = y_seg, yend = y_seg, color = label), linewidth = 1.1, inherit.aes = FALSE) +
+  # facet labels with mean + HDI
+  geom_text(data = subset(summary_a_other, effect != "session"), aes(x = x_label, y = Inf, label = annot, color = label), vjust = 1.1, size = 2.5, show.legend = FALSE) +
+  scale_y_continuous(limits = c(-0.075, 1.1)) +
+  facet_wrap(~ type, scales = "free_x") +
+  labs(x = "Effect on decision boundary a", y = "Posterior density") +
+  scale_color_manual(values = c(rep("slategray",2))) + 
+  scale_fill_manual(values = c(rep("slategray",2))) +
+  theme_minimal(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    #axis.text.y = element_text(size = 8.5),
+    axis.text.x.bottom = element_text(size = 8.5))
+)
+
+ggsave(nback_a_other_effects, file = here("Plots/HSSM/nback_a_other_effects.pdf"), width = 90, height = 55, units = "mm")
+
+# session
+(nback_a_session <- ggplot(subset(df_a_other, effect == "session"), aes(x = value, fill = label, color = label)) +
+  geom_segment(aes(x = 0, xend = 0, y = -0.075, yend = 1), linetype = "dashed", color = "darkslategrey", ) + 
+  geom_density(aes(y = after_stat(scaled)), alpha = 0.6, colour = NA) +
+  # mean line
+  geom_segment(data = subset(summary_a_other, effect == "session"), aes(x = mean, xend = mean, y = 0, yend = 1, color = label), linetype = "dashed", linewidth = .6, show.legend = FALSE) +
+  # 95% HDI bar on baseline
+  geom_segment(data = subset(summary_a_other, effect == "session"), aes(x = hdi_low, xend = hdi_high, y = y_seg, yend = y_seg, color = label), linewidth = 1.1, inherit.aes = FALSE) +
+  # facet labels with mean + HDI
+  geom_text(data = subset(summary_a_other, effect == "session"), aes(x = x_label, y = Inf, label = annot, color = label), vjust = 1.1, size = 2.5, show.legend = FALSE) +
+  scale_y_continuous(limits = c(-0.075, 1.1)) +
+  facet_wrap(~ type, scales = "free_x") +
+  labs(x = "Effect on decision boundary a", y = "Posterior density") +
+  scale_color_manual(values = c("gray75","gray55")) + 
+  scale_fill_manual(values = c("gray75","gray55")) +
+  #scale_color_manual(values = c("tomato3", "indianred1", "grey62", "grey62")) +
+  #scale_fill_manual(values = c("tomato3", "indianred1", "grey62", "grey62")) +
+  theme_minimal(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    #axis.text.y = element_text(size = 8.5),
+    axis.text.x.bottom = element_text(size = 8.5))
+)
+ggsave(nback_a_session, file = here("Plots/HSSM/nback_a_session.pdf"), width = 45, height = 55, units = "mm")
+```
+
+## Reporting summary of posterior estimates
+```{r}
+pd_results <- df_long2 %>%
+  group_by(term, param, effect, label, type) %>%
+  summarise(
+    posterior_mean = mean(value),
+    hdi = hdi(value),
+    pd = p_direction(value),
+    p_map = p_map(value),
+    .groups = "drop"
+  )
+
+pd_results <- pd_results %>%
+  mutate(p_direction_as_p = pd_to_p(pd))
+
+# Prepare table for manuscript ----
+table_df <- df_long2 %>%
+  group_by(term, param, effect, label, type) %>%
+  summarise(
+    posterior_mean = mean(value),
+    ci_low = hdi(value)$CI_low,
+    ci_high = hdi(value)$CI_high,
+    pd = p_direction(value),
+    #p_map = p_map(value),
+    .groups = "drop"
+  ) %>%
+  arrange(param, desc(abs(posterior_mean))) %>%
+  mutate(
+    hdi_str = sprintf("[%.3f, %.3f]", ci_low, ci_high),
+    pd_str = sprintf("%.1f%%", as.numeric(pd) * 100)
+  ) %>%
+  select(param, label, effect, type, posterior_mean, hdi_str, pd_str)
+
+manuscript_table <- table_df %>%
+  filter(effect != "other") %>% 
+  gt(groupname_col = "param") %>%
+  cols_label(
+    effect = "Effect",
+    label = "Term",
+    type = "Type",
+    posterior_mean = "Posterior Mean",
+    hdi_str = "95% HDI",
+    pd_str = "pd",
+    #p_map = "p(MAP)"
+  ) %>%
+  fmt_number(columns = c(posterior_mean), decimals = 3) %>%
+  tab_header(title = "Posterior Estimates of HDDM Parameters") %>%
+  tab_source_note("Note. HDI = highest density interval; pd = probability of direction.") %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_row_groups()
+  ) %>%
+  opt_table_lines("none") %>%
+  tab_options(table.border.top.width = px(2), table.border.bottom.width = px(2))
+
+gtsave(manuscript_table, here("Model_tables/hddm_nback.docx"))
+```
+
+## Model comparison
+```{r}
+# WAIC ----
+mc_nback <- read.csv(here("Raw_data/HSSM/model_comparison_nback_new.csv"))
+
+# calculate difference in waic relative to baseline model
+mc_nback <- mc_nback %>% 
+  mutate(elpd_diff2baseline =
+           elpd_waic[X == "Model 1"] - elpd_waic)
+
+
+# plot WAIC values
+(mc_nback_plot <- ggplot(mc_nback[mc_nback$X != "Model 1",], aes(x = reorder(X, elpd_waic), y = abs(elpd_diff2baseline))) +
+    geom_bar(stat = "identity", fill = "slategray3") +
+    geom_text(aes(label = round(abs(elpd_diff2baseline), 1)), hjust = -0.1, size = 2.8, y = 0) +
+    coord_flip() +
+    labs(x = "Model", y = "Δ WAIC vs baseline") +
+    scale_x_discrete(labels = c(
+      "Model 5" = "v and a",
+      "Model 7" = "v and t",
+      "Model 10" = "v and z",
+      "Model 3" = "v",
+      "Model 9" = "v, a, and t")) +
+    scale_y_continuous(breaks = c(0, 5000, 10000)) +
+    theme_bw(base_size = 9) +
+    theme(
+      text = element_text(family = "Helvetica"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      #plot.margin = unit(c(5.5, 10, 5.5, 5.5), "pt"),
+      axis.line = element_line(),
+      axis.title.y = element_blank(),
+      axis.text.y = element_text(size = 8),
+      axis.text.x.bottom = element_text(size = 8))
+)
+
+ggsave(mc_nback_plot, file = here("Plots/HSSM/mc_nback.pdf"), width = 60, height = 60, units = "mm")
+
+# LOO ----
+mc_nback <- read.csv(here("Raw_data/HSSM/model_comparison_nback_loo.csv"))
+
+# calculate difference in waic relative to baseline model
+mc_nback <- mc_nback %>% 
+  mutate(elpd_diff2baseline =
+           elpd_loo[X == "Model 1"] - elpd_loo)
+
+
+# plot LOO values
+(mc_nback_plot <- ggplot(mc_nback[mc_nback$X != "Model 1",], aes(x = reorder(X, elpd_loo), y = abs(elpd_diff2baseline))) +
+    geom_bar(stat = "identity", fill = "slategray3") +
+    geom_text(aes(label = round(abs(elpd_diff2baseline), 1)), hjust = -0.1, size = 2.8, y = 0) +
+    coord_flip() +
+    labs(x = "Model", y = "Δ ELPD-LOO vs Baseline model") +
+    scale_x_discrete(labels = c(
+      "Model 5" = "v and a",
+      "Model 7" = "v and t",
+      "Model 10" = "v and z",
+      "Model 3" = "v",
+      "Model 9" = "v, a, and t")) +
+    scale_y_continuous(breaks = c(0, 5000, 10000)) +
+    theme_bw(base_size = 9) +
+    theme(
+      text = element_text(family = "Helvetica"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      #plot.margin = unit(c(5.5, 10, 5.5, 5.5), "pt"),
+      axis.line = element_line(),
+      axis.title.y = element_blank(),
+      axis.text.y = element_text(size = 8),
+      axis.text.x.bottom = element_text(size = 8))
+)
+
+ggsave(mc_nback_plot, file = here("Plots/HSSM/mc_nback.pdf"), width = 50, height = 45, units = "mm")
+```
+
+## Recover individual factor levels
+```{r}
+# Drift rate ----
+## TMS ----
+levels <- c("Sham", "Offline", "Offline+Online") 
+k <- length(levels)
+
+draws <- df_long2 %>%
+  filter(param == "v" &
+    # intercept (grand mean)
+    (effect == "other" & type == "main_effect" & label == "v_Intercept" |
+    # simple contrasts for task (within stim_type interactions, etc.)
+    effect == "stim_type" & type == "main_effect")) %>%
+  mutate(
+    level = case_when(
+      label == "v_Intercept" ~ "grand_mean",
+      TRUE ~ label)
+  ) %>%
+  select(chain, draw, level, value) %>% 
+  pivot_wider(id_cols = c(chain, draw),
+              names_from = level, 
+              values_from = value)
+
+draws_wide <- draws %>%
+  mutate(
+    # sum of simple-contrast coeffs (non-ref levels), per draw
+    beta_sum = rowSums(across(all_of(levels[-1])), na.rm = TRUE),
+    
+    # reference level (baseline) per draw
+    !!levels[1] := grand_mean - beta_sum / k,
+    
+    # non-reference levels per draw: reference + their contrast
+    across(
+      all_of(levels[-1]),
+      ~ .data[[levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+draws <- draws_wide %>%
+  select(chain, draw, all_of(levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "level",
+    values_to = "value") %>%
+  mutate(
+    level = str_remove(level, "_abs$"))
+
+summary_TMS <- draws %>%
+  group_by(level) %>%
+  mean_hdi(value, .width = 0.95) %>%
+  transmute(
+    effect   = "stim_type",
+    type     = "reconstructed",
+    label    = level,
+    mean     = value,
+    hdi_low  = .lower,
+    hdi_high = .upper)
+
+## Task ----
+levels <- c("1-back", "2-back") 
+k <- length(levels)
+
+draws <- df_long2 %>%
+  filter(param == "v" &
+    # intercept (grand mean)
+    (effect == "other" & type == "main_effect" & label == "v_Intercept" |
+    # simple contrasts for task (within stim_type interactions, etc.)
+    effect == "task" & type == "main_effect")) %>%
+  mutate(
+    level = case_when(
+      label == "v_Intercept" ~ "grand_mean",
+      TRUE ~ label)
+  ) %>%
+  select(chain, draw, level, value) %>% 
+  pivot_wider(id_cols = c(chain, draw),
+              names_from = level, 
+              values_from = value)
+
+draws_wide <- draws %>%
+  mutate(
+    # sum of simple-contrast coeffs (non-ref levels), per draw
+    beta_sum = rowSums(across(all_of(levels[-1])), na.rm = TRUE),
+    
+    # reference level (baseline) per draw
+    !!levels[1] := grand_mean - beta_sum / k,
+    
+    # non-reference levels per draw: reference + their contrast
+    across(
+      all_of(levels[-1]),
+      ~ .data[[levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+draws <- draws_wide %>%
+  select(chain, draw, all_of(levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "level",
+    values_to = "value") %>%
+  mutate(
+    level = str_remove(level, "_abs$"))
+
+summary_task <- draws %>%
+  group_by(level) %>%
+  mean_hdi(value, .width = 0.95) %>%
+  transmute(
+    effect   = "task",
+    type     = "reconstructed",
+    label    = level,
+    mean     = value,
+    hdi_low  = .lower,
+    hdi_high = .upper)
+
+## TMS x Task interaction ----
+task_levels <- c("1-back", "2-back")
+k_task <- length(task_levels)
+
+task_draws <- df_long2 %>%
+  filter(
+    param == "v" &
+      (
+        effect == "other" & type == "main_effect" & label == "v_Intercept" |
+        effect == "task"  & type == "main_effect"
+      )
+  ) %>%
+  mutate(
+    level = case_when(
+      label == "v_Intercept" ~ "grand_mean",
+      TRUE                   ~ label
+    )
+  ) %>%
+  select(chain, draw, level, value) %>%
+  pivot_wider(
+    id_cols    = c(chain, draw),
+    names_from = level,
+    values_from = value
+  )
+
+task_draws <- task_draws %>%
+  mutate(
+    beta_sum = rowSums(across(all_of(task_levels[-1])), na.rm = TRUE),
+    !!task_levels[1] := grand_mean - beta_sum / k_task,
+    across(
+      all_of(task_levels[-1]),
+      ~ .data[[task_levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+# long, absolute task effects per draw
+task_abs_draws <- task_draws %>%
+  select(chain, draw, all_of(task_levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "task",
+    values_to = "task_abs"
+  ) %>%
+  mutate(task = str_remove(task, "_abs$"))
+
+tms_levels <- c("Sham", "Offline", "Offline+Online")
+
+int_draws <- df_long2 %>%
+  filter(
+    param == "v",
+    effect == "stim_type",      # adjust if your effect label differs
+    type   == "interaction",
+    str_detect(label, "task_simp_")
+  ) %>%
+  mutate(
+    # tms: part before ".task_simp_..."
+    tms  = str_remove(label, "\\.task_simp_.*$"),
+    # task: part after "task_simp_"
+    task = str_remove(label, ".*task_simp_")
+  ) %>%
+  select(chain, draw, tms, task, value) %>% 
+  mutate(task = case_when(
+    task == "2back_single_main_click" ~ "2-back",
+    TRUE ~ NA
+  ))
+
+tms_task_draws <- task_abs_draws %>%
+  # expand to all TMS conditions for each draw
+  crossing(tms = tms_levels) %>%
+  left_join(
+    int_draws,
+    by = c("chain", "draw", "tms", "task")
+  ) %>%
+  mutate(
+    int_offset   = coalesce(value, 0),          # 0 for sham or missing combos
+    mu_tms_task  = task_abs + int_offset)
+
+summary_tms_task <- tms_task_draws %>%
+  group_by(tms, task) %>%
+  mean_hdi(mu_tms_task, .width = 0.95) %>%
+  transmute(
+    effect   = "stim_type",
+    type     = "reconstructed",
+    label    = paste0(tms, " × ", task),
+    mean     = mu_tms_task,
+    hdi_low  = .lower,
+    hdi_high = .upper
+  )
+
+## Trigger ----
+levels <- c("False", "True") 
+k <- length(levels)
+
+draws <- df_long2 %>%
+  filter(param == "v" &
+    # intercept (grand mean)
+    (effect == "other" & type == "main_effect" & label == "v_Intercept" |
+    # simple contrasts for task (within stim_type interactions, etc.)
+    effect == "is_trigger" & type == "main_effect")) %>%
+  mutate(
+    level = case_when(
+      label == "v_Intercept" ~ "grand_mean",
+      TRUE ~ label)
+  ) %>%
+  select(chain, draw, level, value) %>% 
+  pivot_wider(id_cols = c(chain, draw),
+              names_from = level, 
+              values_from = value)
+
+draws_wide <- draws %>%
+  mutate(
+    # sum of simple-contrast coeffs (non-ref levels), per draw
+    beta_sum = rowSums(across(all_of(levels[-1])), na.rm = TRUE),
+    
+    # reference level (baseline) per draw
+    !!levels[1] := grand_mean - beta_sum / k,
+    
+    # non-reference levels per draw: reference + their contrast
+    across(
+      all_of(levels[-1]),
+      ~ .data[[levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+draws <- draws_wide %>%
+  select(chain, draw, all_of(levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "level",
+    values_to = "value") %>%
+  mutate(
+    level = str_remove(level, "_abs$"))
+
+summary_trigger <- draws %>%
+  group_by(level) %>%
+  mean_hdi(value, .width = 0.95) %>%
+  transmute(
+    effect   = "trigger",
+    type     = "reconstructed",
+    label    = level,
+    mean     = value,
+    hdi_low  = .lower,
+    hdi_high = .upper)
+
+## Session ----
+levels <- c("1", "2", "3") 
+k <- length(levels)
+
+draws <- df_long2 %>%
+  filter(param == "v" &
+    # intercept (grand mean)
+    (effect == "other" & type == "main_effect" & label == "v_Intercept" |
+    # simple contrasts for task (within stim_type interactions, etc.)
+    effect == "session")) %>%
+  mutate(
+    level = case_when(
+      label == "v_Intercept" ~ "grand_mean",
+      TRUE ~ label)
+  ) %>%
+  select(chain, draw, level, value) %>% 
+  pivot_wider(id_cols = c(chain, draw),
+              names_from = level, 
+              values_from = value)
+
+draws_wide <- draws %>%
+  mutate(
+    # sum of simple-contrast coeffs (non-ref levels), per draw
+    beta_sum = rowSums(across(all_of(levels[-1])), na.rm = TRUE),
+    
+    # reference level (baseline) per draw
+    !!levels[1] := grand_mean - beta_sum / k,
+    
+    # non-reference levels per draw: reference + their contrast
+    across(
+      all_of(levels[-1]),
+      ~ .data[[levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+draws <- draws_wide %>%
+  select(chain, draw, all_of(levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "level",
+    values_to = "value") %>%
+  mutate(
+    level = str_remove(level, "_abs$"))
+
+summary_session <- draws %>%
+  group_by(level) %>%
+  mean_hdi(value, .width = 0.95) %>%
+  transmute(
+    effect   = "session",
+    type     = "reconstructed",
+    label    = level,
+    mean     = value,
+    hdi_low  = .lower,
+    hdi_high = .upper)
+
+# Merge all parameters into one df
+df_indiv_parameters_v <- rbind(summary_TMS, summary_task, summary_tms_task, summary_session, summary_trigger)
+
+
+# Decision boundary ----
+## TMS ----
+levels <- c("Sham", "Offline", "Offline+Online") 
+k <- length(levels)
+
+draws <- df_long2 %>%
+  filter(param == "a" &
+    # intercept (grand mean)
+    (effect == "other" & type == "main_effect" & label == "a_Intercept" |
+    # simple contrasts for task (within stim_type interactions, etc.)
+    effect == "stim_type" & type == "main_effect")) %>%
+  mutate(
+    level = case_when(
+      label == "a_Intercept" ~ "grand_mean",
+      TRUE ~ label)
+  ) %>%
+  select(chain, draw, level, value) %>% 
+  pivot_wider(id_cols = c(chain, draw),
+              names_from = level, 
+              values_from = value)
+
+draws_wide <- draws %>%
+  mutate(
+    # sum of simple-contrast coeffs (non-ref levels), per draw
+    beta_sum = rowSums(across(all_of(levels[-1])), na.rm = TRUE),
+    
+    # reference level (baseline) per draw
+    !!levels[1] := grand_mean - beta_sum / k,
+    
+    # non-reference levels per draw: reference + their contrast
+    across(
+      all_of(levels[-1]),
+      ~ .data[[levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+draws <- draws_wide %>%
+  select(chain, draw, all_of(levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "level",
+    values_to = "value") %>%
+  mutate(
+    level = str_remove(level, "_abs$"))
+
+summary_TMS <- draws %>%
+  group_by(level) %>%
+  mean_hdi(value, .width = 0.95) %>%
+  transmute(
+    effect   = "stim_type",
+    type     = "reconstructed",
+    label    = level,
+    mean     = value,
+    hdi_low  = .lower,
+    hdi_high = .upper)
+
+## Task ----
+levels <- c("1-back", "2-back") 
+k <- length(levels)
+
+draws <- df_long2 %>%
+  filter(param == "a" &
+    # intercept (grand mean)
+    (effect == "other" & type == "main_effect" & label == "a_Intercept" |
+    # simple contrasts for task (within stim_type interactions, etc.)
+    effect == "task" & type == "main_effect")) %>%
+  mutate(
+    level = case_when(
+      label == "a_Intercept" ~ "grand_mean",
+      TRUE ~ label)
+  ) %>%
+  select(chain, draw, level, value) %>% 
+  pivot_wider(id_cols = c(chain, draw),
+              names_from = level, 
+              values_from = value)
+
+draws_wide <- draws %>%
+  mutate(
+    # sum of simple-contrast coeffs (non-ref levels), per draw
+    beta_sum = rowSums(across(all_of(levels[-1])), na.rm = TRUE),
+    
+    # reference level (baseline) per draw
+    !!levels[1] := grand_mean - beta_sum / k,
+    
+    # non-reference levels per draw: reference + their contrast
+    across(
+      all_of(levels[-1]),
+      ~ .data[[levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+draws <- draws_wide %>%
+  select(chain, draw, all_of(levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "level",
+    values_to = "value") %>%
+  mutate(
+    level = str_remove(level, "_abs$"))
+
+summary_task <- draws %>%
+  group_by(level) %>%
+  mean_hdi(value, .width = 0.95) %>%
+  transmute(
+    effect   = "task",
+    type     = "reconstructed",
+    label    = level,
+    mean     = value,
+    hdi_low  = .lower,
+    hdi_high = .upper)
+
+## TMS x Task interaction ----
+task_levels <- c("1-back", "2-back")
+k_task <- length(task_levels)
+
+task_draws <- df_long2 %>%
+  filter(
+    param == "a" &
+      (
+        effect == "other" & type == "main_effect" & label == "a_Intercept" |
+        effect == "task"  & type == "main_effect"
+      )
+  ) %>%
+  mutate(
+    level = case_when(
+      label == "a_Intercept" ~ "grand_mean",
+      TRUE                   ~ label
+    )
+  ) %>%
+  select(chain, draw, level, value) %>%
+  pivot_wider(
+    id_cols    = c(chain, draw),
+    names_from = level,
+    values_from = value
+  )
+
+task_draws <- task_draws %>%
+  mutate(
+    beta_sum = rowSums(across(all_of(task_levels[-1])), na.rm = TRUE),
+    !!task_levels[1] := grand_mean - beta_sum / k_task,
+    across(
+      all_of(task_levels[-1]),
+      ~ .data[[task_levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+# long, absolute task effects per draw
+task_abs_draws <- task_draws %>%
+  select(chain, draw, all_of(task_levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "task",
+    values_to = "task_abs"
+  ) %>%
+  mutate(task = str_remove(task, "_abs$"))
+
+tms_levels <- c("Sham", "Offline", "Offline+Online")
+
+int_draws <- df_long2 %>%
+  filter(
+    param == "a",
+    effect == "stim_type",  
+    type   == "interaction",
+    str_detect(label, "task_simp_")
+  ) %>%
+  mutate(
+    # tms: part before ".task_simp_..."
+    tms  = str_remove(label, "\\.task_simp_.*$"),
+    # task: part after "task_simp_"
+    task = str_remove(label, ".*task_simp_")
+  ) %>%
+  select(chain, draw, tms, task, value) %>% 
+  mutate(task = case_when(
+    task == "2back_single_main_click" ~ "2-back",
+    TRUE ~ NA
+  ))
+
+tms_task_draws <- task_abs_draws %>%
+  # expand to all TMS conditions for each draw
+  crossing(tms = tms_levels) %>%
+  left_join(
+    int_draws,
+    by = c("chain", "draw", "tms", "task")
+  ) %>%
+  mutate(
+    int_offset   = coalesce(value, 0),          # 0 for sham or missing combos
+    mu_tms_task  = task_abs + int_offset)
+
+summary_tms_task <- tms_task_draws %>%
+  group_by(tms, task) %>%
+  mean_hdi(mu_tms_task, .width = 0.95) %>%
+  transmute(
+    effect   = "stim_type",
+    type     = "reconstructed",
+    label    = paste0(tms, " × ", task),
+    mean     = mu_tms_task,
+    hdi_low  = .lower,
+    hdi_high = .upper
+  )
+
+## Trigger ----
+levels <- c("False", "True") 
+k <- length(levels)
+
+draws <- df_long2 %>%
+  filter(param == "a" &
+    # intercept (grand mean)
+    (effect == "other" & type == "main_effect" & label == "a_Intercept" |
+    # simple contrasts for task (within stim_type interactions, etc.)
+    effect == "is_trigger" & type == "main_effect")) %>%
+  mutate(
+    level = case_when(
+      label == "a_Intercept" ~ "grand_mean",
+      TRUE ~ label)
+  ) %>%
+  select(chain, draw, level, value) %>% 
+  pivot_wider(id_cols = c(chain, draw),
+              names_from = level, 
+              values_from = value)
+
+draws_wide <- draws %>%
+  mutate(
+    # sum of simple-contrast coeffs (non-ref levels), per draw
+    beta_sum = rowSums(across(all_of(levels[-1])), na.rm = TRUE),
+    
+    # reference level (baseline) per draw
+    !!levels[1] := grand_mean - beta_sum / k,
+    
+    # non-reference levels per draw: reference + their contrast
+    across(
+      all_of(levels[-1]),
+      ~ .data[[levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+draws <- draws_wide %>%
+  select(chain, draw, all_of(levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "level",
+    values_to = "value") %>%
+  mutate(
+    level = str_remove(level, "_abs$"))
+
+summary_trigger <- draws %>%
+  group_by(level) %>%
+  mean_hdi(value, .width = 0.95) %>%
+  transmute(
+    effect   = "trigger",
+    type     = "reconstructed",
+    label    = level,
+    mean     = value,
+    hdi_low  = .lower,
+    hdi_high = .upper)
+
+
+## Session ----
+levels <- c("1", "2", "3") 
+k <- length(levels)
+
+draws <- df_long2 %>%
+  filter(param == "a" &
+    # intercept (grand mean)
+    (effect == "other" & type == "main_effect" & label == "a_Intercept" |
+    # simple contrasts for task (within stim_type interactions, etc.)
+    effect == "session")) %>%
+  mutate(
+    level = case_when(
+      label == "a_Intercept" ~ "grand_mean",
+      TRUE ~ label)
+  ) %>%
+  select(chain, draw, level, value) %>% 
+  pivot_wider(id_cols = c(chain, draw),
+              names_from = level, 
+              values_from = value)
+
+draws_wide <- draws %>%
+  mutate(
+    # sum of simple-contrast coeffs (non-ref levels), per draw
+    beta_sum = rowSums(across(all_of(levels[-1])), na.rm = TRUE),
+    
+    # reference level (baseline) per draw
+    !!levels[1] := grand_mean - beta_sum / k,
+    
+    # non-reference levels per draw: reference + their contrast
+    across(
+      all_of(levels[-1]),
+      ~ .data[[levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+draws <- draws_wide %>%
+  select(chain, draw, all_of(levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "level",
+    values_to = "value") %>%
+  mutate(
+    level = str_remove(level, "_abs$"))
+
+summary_session <- draws %>%
+  group_by(level) %>%
+  mean_hdi(value, .width = 0.95) %>%
+  transmute(
+    effect   = "session",
+    type     = "reconstructed",
+    label    = level,
+    mean     = value,
+    hdi_low  = .lower,
+    hdi_high = .upper)
+
+# Merge all parameters into one df
+df_indiv_parameters_a <- rbind(summary_TMS, summary_task, summary_tms_task, summary_session, summary_trigger)
+
+# Merge dfs for v and a
+df_indiv_parameters_v$parameter <- "v"
+df_indiv_parameters_a$parameter <- "a"
+
+df_indiv_parameters <- full_join(df_indiv_parameters_v, df_indiv_parameters_a)
+df_indiv_parameters <- df_indiv_parameters %>% 
+  mutate(type = case_when(
+    str_detect(label, "×") ~ "interaction",
+    TRUE ~ "main_effect"
+  ))
+
+saveRDS(df_indiv_parameters, file = here("RData/HSSM/df_indiv_parameters.rds"))
+```
+
+### Plot level-specific parameters
+```{r}
+# Drift rate v ----
+df_v <- df_indiv_parameters %>% 
+  filter(parameter == "v" & effect != "session" & effect != "trigger")
+
+df_v$label <- factor(df_v$label, levels = c("Sham","Offline","Offline+Online","Sham × 1-back", "Sham × 2-back","Offline × 1-back","Offline × 2-back","Offline+Online × 1-back","Offline+Online × 2-back", "1-back","2-back"))
+df_v$type <- factor(df_v$type, levels = c("main_effect", "interaction"))
+df_v$effect <- factor(df_v$effect, levels = c("stim_type", "task", "session"))
+
+## Plot ----
+(nback_indiv_params_v <- ggplot(df_v, aes(x = label, y = mean, colour = label)) +
+  geom_errorbar(aes(ymin = hdi_low, ymax = hdi_high), width = 0.25, linewidth = 0.5) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(breaks = c(0, 1, 2), limits = c(-0.5, 2.3)) +
+  scale_color_manual(values = cols_nback_indiv_params) +
+  scale_fill_manual(values = cols_nback_indiv_params) +
+  facet_wrap(~ effect + type, scales = "free_x", axes = "all", space = "free_x") +
+  theme_bw(base_size = 5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.x = element_blank(),
+    #axis.text.y = element_blank(),
+    axis.text.y = element_text(size = 5),
+    axis.text.x.bottom = element_text(size = 5, hjust = 1, vjust = 1, angle = 45))
+)
+
+ggsave(nback_indiv_params_v, file = here("Plots/HSSM/nback_indiv_params_v.pdf"), width = 47, height = 40, units = "mm")
+
+# separate plot for trigger
+df <- df_indiv_parameters %>% 
+  filter(effect == "trigger")
+
+df$label <- factor(df$label, levels = c("False","True"))
+
+## Plot ----
+(nback_indiv_params_trigger <- ggplot(df, aes(x = label, y = mean, colour = label)) +
+  geom_errorbar(aes(ymin = hdi_low, ymax = hdi_high), width = 0.25, linewidth = 0.5) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  #scale_y_continuous(breaks = c(0, 1, 2), limits = c(-0.5, 2.3)) +
+  scale_color_manual(values = c("slategray2", "slategrey")) +
+  scale_fill_manual(values = c("slategray2", "slategrey")) +
+  facet_wrap(~ parameter, scales = "free", axes = "all", space = "free_x") +
+  theme_bw(base_size = 5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.x = element_blank(),
+    #axis.text.y = element_blank(),
+    axis.text.y = element_text(size = 5),
+    axis.text.x.bottom = element_text(size = 5, hjust = 1, vjust = 1, angle = 45))
+)
+
+ggsave(nback_indiv_params_trigger, file = here("Plots/HSSM/nback_indiv_params_trigger.pdf"), width = 35, height = 30, units = "mm")
+
+# Decision boundary a ----
+df_a <- df_indiv_parameters %>% 
+  filter(parameter == "a" & effect != "session" & effect != "trigger")
+
+df_a$label <- factor(df_a$label, levels = c("Sham","Offline","Offline+Online","Sham × 1-back", "Sham × 2-back","Offline × 1-back","Offline × 2-back","Offline+Online × 1-back","Offline+Online × 2-back", "1-back","2-back"))
+df_a$type <- factor(df_a$type, levels = c("main_effect", "interaction"))
+df_a$effect <- factor(df_a$effect, levels = c("stim_type", "task", "session"))
+
+## Plot ----
+(nback_indiv_params_a <- ggplot(df_a, aes(x = label, y = mean, colour = label)) +
+  geom_errorbar(aes(ymin = hdi_low, ymax = hdi_high), width = 0.25, linewidth = 0.5) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(breaks = c(-0.25, 0, 0.25), limits = c(-0.5, 0.25)) +
+  scale_color_manual(values = cols_nback_indiv_params) +
+  scale_fill_manual(values = cols_nback_indiv_params) +
+  facet_wrap(~ effect + type, scales = "free_x", axes = "all", space = "free_x") +
+  theme_bw(base_size = 5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.x = element_blank(),
+    #axis.text.y = element_blank(),
+    axis.text.y = element_text(size = 5),
+    axis.text.x.bottom = element_text(size = 5, hjust = 1, vjust = 1, angle = 45))
+)
+
+ggsave(nback_indiv_params_a, file = here("Plots/HSSM/nback_indiv_params_a.pdf"), width = 55, height = 40, units = "mm")
+```
+
+## Subject-specific parameters
+```{r}
+df_subject_parameters_nback <- read.csv(here("Raw_data/HSSM/nback_va_int_subject_params.csv"), header = TRUE, sep = ",")
+df_subject_parameters_nback <- df_subject_parameters_nback[,2:length(df_subject_parameters_nback)]
+
+(plot_subject_params <- ggplot(df_subject_parameters_nback, aes(x = parameter, y = mean, fill = parameter, color = parameter)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "darkslategrey") + 
+    geom_violinhalf(color = NA, position = position_nudge(x = 0.025)) +
+    geom_jitter2(position = position_nudge(x = -0.025)) +
+    theme_bw(base_size = 9.5) +
+  theme(
+    legend.position = "bottom",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    plot.margin = unit(c(5.5, 10, 5.5, 5.5), "pt"),
+    axis.line = element_line(),
+    axis.text.y = element_text(size = 8.5),
+    axis.text.x.bottom = element_text(size = 8.5, hjust = 1, vjust = 1, angle = 45))
+)
+```
+
+
+## Read e-fields
+```{r}
+df_subject_parameters_nback <- read.csv(here("Raw_data/HSSM/HSSM_subject_parameters.csv"), header = TRUE, sep = ",")
+df_subject_parameters_nback <- df_subject_parameters_nback[,2:length(df_subject_parameters_nback)]
+
+df_efields = read.table(here::here("average_efields_sphere_10mm_percentile_95.txt"), header = T, sep = ",")
+df_efields$participant <- gsub("sub-", "", df_efields$participant)
+
+df_efields <- df_efields %>% 
+  rename(stim_type = session)
+df_efields$stim_type <- as.factor(df_efields$stim_type)
+df_efields$stim_type <- dplyr::recode(df_efields$stim_type, 
+                               "offline" = "Offline", 
+                               "offline_online" = "Offline + Online")
+
+df_efields_wide <- df_efields %>% 
+  pivot_wider(names_from = c(stim_type, roi), values_from = mean_field)
+df_efields_wide$participant <- gsub("^0", "", df_efields_wide$participant)
+
+df_subject_parameters_nback$participant <- as.character(df_subject_parameters_nback$participant)
+test <- full_join(df_subject_parameters_nback, df_efields_wide)
+
+```
+
+## Correlations
+```{r}
+cor_results_nback <- test %>%
+  group_modify(~ {
+    cor1 <- broom::tidy(cor.test(.x$`Offline + Online_DLPFC`, .x$v_tms_offline_online))
+    cor2 <- broom::tidy(cor.test(.x$`Offline + Online_DLPFC`, .x$a_tms_offline_online))
+    cor3 <- broom::tidy(cor.test(.x$`Offline + Online_AG`, .x$v_tms_offline_online))
+    cor4 <- broom::tidy(cor.test(.x$`Offline + Online_AG`, .x$a_tms_offline_online))
+    cor5 <- broom::tidy(cor.test(.x$Offline_AG, .x$v_tms_offline))
+    cor6 <- broom::tidy(cor.test(.x$Offline_AG, .x$a_tms_offline))
+    dplyr::bind_rows(
+      cor1 %>% mutate(corr = "DLPFC_offon_vs_v_offon"),
+      cor2 %>% mutate(corr = "DLPFC_offon_vs_a_offon"),
+      cor3 %>% mutate(corr = "AG_offon_vs_v_offon"),
+      cor4 %>% mutate(corr = "AG_offon_vs_a_offon"),
+      cor5 %>% mutate(corr = "AG_off_vs_v_off"),
+      cor6 %>% mutate(corr = "AG_off_vs_a_off")
+    ) %>%
+      select(corr, estimate, p.value)
+  })
+```
+
+```{r}
+# Order them as you like
+cor_vec <- cor_results_nback %>%
+  arrange(corr) %>%        # optional
+  pull(estimate)
+
+p_vec <- cor_results_nback %>%
+  arrange(corr) %>%
+  pull(p.value)
+
+# 6x1 "matrix" of correlations (6 rows, 1 column)
+cor_mat <- matrix(cor_vec, nrow = length(cor_vec), ncol = 1)
+rownames(cor_mat) <- cor_results_nback %>%
+  arrange(corr) %>%
+  pull(corr)
+colnames(cor_mat) <- "correlation"
+
+# same shape for p values
+p_mat <- matrix(p_vec, nrow = length(p_vec), ncol = 1)
+rownames(p_mat) <- rownames(cor_mat)
+colnames(p_mat) <- colnames(cor_mat)
+
+library(corrplot)
+
+corrplot(
+  cor_mat,
+  method      = "color",
+  tl.col      = "black",
+  tl.srt      = 0,
+  p.mat       = p_mat,   # still available if you want it later
+  sig.level   = 0.05,
+  insig       = "n",     # <- do nothing for non‑sig: show all tiles
+  addCoef.col = "black", # <- write r in each cell
+  number.digits = 2,     # 2 decimal places
+  number.cex  = 0.85,     # size of the numbers
+  cl.lim        = c(-1, 1),
+  cl.pos        = "r",     # legend on the right (default)
+  cl.ratio      = 1,     # make legend narrower (0.1–0.2 usually good)
+  cl.align      = "c",     # center the legend vertically
+  mar           = c(2, 1, 2, 4)  # bottom, left, top, right margins
+)
+```
+
+
+# DUAL TASK HSSM
+```{r}
+# load file with posterior draws
+dual_task_nback <- read.csv(here("Raw_data/HSSM/dual_task_va_int.csv"), sep = ",")
+
+dual_task_nback <- dual_task_nback %>% 
+  rename("v_stim_type_simp_Offline+Online.surprisal_2" = "v_stim_type_simp_Offline...Online.surprisal_2",
+         "v_stim_type_simp_Offline+Online" =  "v_stim_type_simp_Offline...Online",
+         "a_stim_type_simp_Offline+Online.surprisal_2" = "a_stim_type_simp_Offline...Online.surprisal_2",
+         "a_stim_type_simp_Offline+Online" =  "a_stim_type_simp_Offline...Online",
+         )
+
+df_long <- dual_task_nback %>% 
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "term",
+    values_to = "value"
+  )
+
+df_long2 <- df_long %>% 
+  mutate(
+    param = if_else(str_starts(term, "v_"), "v",
+             if_else(str_starts(term, "a_"), "a", NA_character_)),
+    effect = case_when(
+      str_detect(term, "session_simp") ~ "session",
+      str_detect(term, "stim_type_simp") ~ "stim_type",
+      str_detect(term, "task_simp") ~ "task",
+      str_detect(term, "is_trigger") ~ "is_trigger",
+      str_detect(term, "time_from_onset_task") ~ "time_from_onset_task",
+      str_detect(term, "entropy") ~ "entropy",
+      str_detect(term, "word_length_single") ~ "word_length",
+      str_detect(term, "zipf_frequency") ~ "frequency",
+      str_detect(term, "surprisal_2") ~ "surprisal",
+      TRUE ~ "other"
+    )
+  ) %>% 
+  filter(!is.na(param))  # keep only v/a parameters
+
+df_long2 <- df_long2 %>% 
+  mutate(
+    label = case_when(
+      effect == "session" ~ str_remove(term, "^[va]_session_simp_"),
+      effect == "stim_type" ~ str_remove(term, "^[va]_stim_type_simp_"),
+      effect == "task" ~ str_remove(term, "^[va]_task_simp_"),
+      effect == "is_trigger" ~ str_remove(term, "^[va]_is_trigger_simp_"),
+      effect == "time_from_onset_task" ~ str_remove(term, "^[va]_"),
+      effect == "entropy" ~ str_remove(term, "^[va]_"),
+      effect == "word_length" ~ str_remove(term, "^[va]_"),
+      effect == "frequency" ~ str_remove(term, "^[va]_zipf_"),
+      effect == "surprisal" ~ str_remove(term, "^[va]_"),
+      TRUE ~ term),
+    type = case_when(
+      str_detect(term, "\\.") ~ "interaction",
+      TRUE ~ "main_effect")
+  )
+
+# Recover sham posteriors ----
+# k <- 3
+# df_sham_v <- df_nback %>%
+#   transmute(
+#     chain,
+#     draw,
+#     v_sham = v_Intercept -
+#       (1 / k) * v_stim_type_simp_Offline -
+#       (1 / k) * `v_stim_type_simp_Offline+Online`)
+# test <- full_join(df_nback, df_sham_v)
+
+```
+
+## Drift rate: Plotting posterior distributions
+```{r}
+df_v <- df_long2 %>% 
+  filter(param == "v")
+
+# compute summary stats (95% HDI, mean HDI) 
+summary_v <- df_v %>% 
+  group_by(effect, type, label) %>% 
+  summarise(
+    mean = mean(value),
+    hdi_obj = list(bayestestR::hdi(value, ci = 0.95)),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    hdi_low  = map_dbl(hdi_obj, ~ .x$CI_low),
+    hdi_high = map_dbl(hdi_obj, ~ .x$CI_high),
+    annot = sprintf("M = %.2f [%.2f, %.2f]", mean, hdi_low, hdi_high)
+  ) %>% 
+  select(-hdi_obj)
+
+# TMS and TASK ----
+stimType_order = c("Offline", "Offline+Online", "Offline.surprisal_2", "Offline+Online.surprisal_2")
+
+# subset for stim_type
+df_v_stimType <- subset(df_v, effect == "stim_type")
+df_v_stimType$label <- factor(df_v_stimType$label, levels = stimType_order, labels = c("Offline TMS", "Offline+Online TMS", "Offline TMS: Surprisal", "Offline+Online TMS: Surprisal"))
+df_v_stimType$type <- factor(df_v_stimType$type, levels = c("main_effect", "interaction"), labels = c("Main effect TMS", "Interaction TMS x Surprisal"))
+
+# subset for surprisal
+df_v_surp <- subset(df_v, effect == "surprisal")
+df_v_surp$label <- factor(df_v_surp$label, labels = "Surprisal")
+df_v_surp$type <- factor(
+  df_v_surp$type, 
+  levels = "main_effect", 
+  labels = "Main effect Surprisal"
+)
+
+# combined df for plotting
+df_v_combined <- bind_rows(df_v_stimType, df_v_surp)
+df_v_combined$type <- factor(df_v_combined$type, levels = c("Main effect TMS", "Main effect Surprisal", "Interaction TMS x Surprisal"))
+
+# subset summary stats
+
+# determine max density value for plotting
+# dens_peaks <- df_v %>%
+#   group_by(label, type) %>%
+#   summarise(
+#     max_density = max(density(value)$y),  # compute density on value
+#     .groups = "drop"
+#   )
+
+summary_v_stimType <- subset(summary_v, effect == "stim_type")
+#summary_v_stimType <- left_join(summary_v_stimType, dens_peaks)
+summary_v_stimType$label <- factor(summary_v_stimType$label, levels = stimType_order, labels = c("Offline TMS", "Offline+Online TMS", "Offline TMS: Surprisal", "Offline+Online TMS: Surprisal"))
+summary_v_stimType$type <- factor(summary_v_stimType$type, levels = c("main_effect", "interaction"), labels = c("Main effect TMS", "Interaction TMS x Surprisal"))
+
+summary_v_stimType <- summary_v_stimType %>% 
+  mutate(x_label = case_when(
+    label == "Offline TMS" ~ -0.18,
+    label == "Offline+Online TMS" ~ 0.075,
+    label == "Offline+Online TMS: Surprisal" ~ -0.05,
+    label == "Offline TMS: Surprisal" ~ 0.04,
+    TRUE ~ mean
+  ))
+
+summary_v_stimType$y_seg <- -0.045
+summary_v_stimType$y_seg[str_detect(summary_v_stimType$label, "Online")] <- -0.075
+
+# task summary
+summary_v_surp <- subset(summary_v, effect == "surprisal")
+#summary_v_surp <- summary_v_surp %>% 
+#  left_join(dens_peaks)
+summary_v_surp$label <- factor(summary_v_surp$label, labels = "Surprisal")
+summary_v_surp$type  <- factor(summary_v_surp$type, 
+                               levels = "main_effect", 
+                               labels = "Main effect Surprisal")
+
+summary_v_surp$x_label <- summary_v_surp$mean
+summary_v_surp$y_seg   <- -0.06
+
+# combined summary for plotting
+summary_v_combined <- bind_rows(summary_v_stimType, summary_v_surp)
+summary_v_combined$type <- factor(summary_v_combined$type, levels = c("Main effect TMS", "Main effect Surprisal", "Interaction TMS x Surprisal"))
+
+## PLOT ----
+(dual_task_v_TMS_task <- ggplot(df_v_combined, aes(x = value, fill = label, color = label)) +
+  geom_segment(aes(x = 0, xend = 0, y = -0.075, yend = 1), linetype = "dashed", color = "darkslategrey", ) + 
+  geom_density(aes(y = after_stat(scaled)), alpha = 0.6, colour = NA) +
+  # mean line
+  geom_segment(data = summary_v_combined, aes(x = mean, xend = mean, y = 0, yend = 1, color = label), linetype = "dashed", linewidth = .6, show.legend = FALSE) +
+  # 95% HDI bar on baseline
+  geom_segment(data = summary_v_combined, aes(x = hdi_low, xend = hdi_high, y = y_seg, yend = y_seg, color = label), linewidth = 1.1, inherit.aes = FALSE) +
+  # facet labels with mean + HDI
+  geom_text(data = summary_v_combined, aes(x = x_label, y = Inf, label = annot, color = label), vjust = 1.1, size = 2.5, show.legend = FALSE) +
+  scale_y_continuous(limits = c(-0.075, 1.1)) +
+  facet_wrap(~ type, scales = "free_x") +
+  labs(x = "Effect on drift v", y = "Posterior density") +
+  scale_color_manual(values = cols_dual) +
+  scale_fill_manual(values = cols_dual) +
+  theme_minimal(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    #axis.text.y = element_text(size = 8.5),
+    axis.text.x.bottom = element_text(size = 8.5))
+)
+
+ggsave(dual_task_v_TMS_task, file = here("Plots/HSSM/dual_task_v_TMS_task.pdf"), width = 135, height = 55, units = "mm")
+
+# Other effects ----
+df_v_other <- subset(df_v, effect != "stim_type" & effect != "surprisal" & type == "main_effect" & effect != "other")
+df_v_other <- df_v_other %>% 
+  mutate(type = case_when(
+    effect == "is_trigger" ~ "Main effect Trigger",
+    effect == "session" ~ "Main effect Session",
+    effect == "time_from_onset_task" ~ "Main effect Time",
+    effect == "entropy" ~ "Main effect Entropy",
+    effect == "word_length" ~ "Main effect Word length",
+    effect == "frequency" ~ "Main effect Frequency",
+  ))
+
+summary_v_other <- subset(summary_v, effect != "stim_type" & effect != "surprisal" & type == "main_effect" & effect != "other")
+
+# determine max density value for plotting
+# dens_peaks <- df_v_other %>%
+#   group_by(label, type) %>%
+#   summarise(
+#     max_density = max(density(value)$y),  # compute density on value
+#     .groups = "drop"
+#   )
+
+summary_v_other <- summary_v_other %>% 
+  mutate(
+    type = case_when(
+      effect == "is_trigger" ~ "Main effect Trigger",
+      effect == "session" ~ "Main effect Session",
+      effect == "time_from_onset_task" ~ "Main effect Time",
+      effect == "entropy" ~ "Main effect Entropy",
+      effect == "word_length" ~ "Main effect Word length",
+      effect == "frequency" ~ "Main effect Frequency")) %>% 
+  #left_join(dens_peaks, by = c("label", "type")) %>% 
+  mutate(
+    y_seg = case_when(
+      str_detect(label, "2") ~ -0.045,
+      str_detect(label, "3") ~ -0.075,
+      TRUE ~ -0.06
+    ),
+    x_label = case_when(
+      label == "2" ~ 0.18,
+      label == "3" ~ 0.35,
+      TRUE ~ mean
+    )
+  )
+
+## PLOT ----
+(dual_task_v_other_effects <- ggplot(subset(df_v_other, effect != "session" & effect != "word_length"), aes(x = value, fill = label, color = label)) +
+  geom_segment(aes(x = 0, xend = 0, y = -0.075, yend = 1), linetype = "dashed", color = "darkslategrey", linewidth = 0.5) + 
+  geom_density(aes(y = after_stat(scaled)), alpha = 0.6, colour = NA) +
+  # mean line
+  geom_segment(data = subset(summary_v_other, effect != "session" & effect != "word_length"), aes(x = mean, xend = mean, y = 0, yend = 1, color = label), linetype = "dashed", linewidth = .85, show.legend = FALSE) +
+  # 95% HDI bar on baseline
+  geom_segment(data = subset(summary_v_other, effect != "session" & effect != "word_length"), aes(x = hdi_low, xend = hdi_high, y = y_seg, yend = y_seg, color = label), linewidth = 1.1, inherit.aes = FALSE) +
+  # facet labels with mean + HDI
+  geom_text(data = subset(summary_v_other, effect != "session" & effect != "word_length"), aes(x = x_label, y = Inf, label = annot, color = label), vjust = 1.1, size = 2.5, show.legend = FALSE) +
+  scale_y_continuous(limits = c(-0.075, 1.1)) +
+  facet_wrap(~ type, scales = "free_x", nrow = 1) +
+  labs(x = "Effect on drift v", y = "Posterior density") +
+  scale_color_manual(values = c(rep("slategray", 4))) +
+  scale_fill_manual(values = c(rep("slategray", 4))) +
+  #scale_color_manual(values = c("tomato3", "indianred1", "grey62", "grey62", "grey62", "grey62", "grey62", "grey62")) +
+  #scale_fill_manual(values = c("tomato3", "indianred1", "grey62", "grey62", "grey62", "grey62", "grey62", "grey62")) +
+  theme_minimal(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    #axis.text.y = element_text(size = 8.5),
+    axis.text.x.bottom = element_text(size = 8.5))
+)
+
+ggsave(dual_task_v_other_effects, file = here("Plots/HSSM/dual_task_v_other_effects.pdf"), width = 135, height = 55, units = "mm")
+
+# session
+(dual_task_v_session <- ggplot(subset(df_v_other, effect == "session"), aes(x = value, fill = label, color = label)) +
+  geom_segment(aes(x = 0, xend = 0, y = -0.075, yend = 1), linetype = "dashed", color = "darkslategrey", ) + 
+  geom_density(aes(y = after_stat(scaled)), alpha = 0.6, colour = NA) +
+  # mean line
+  geom_segment(data = subset(summary_v_other, effect == "session"), aes(x = mean, xend = mean, y = 0, yend = 1, color = label), linetype = "dashed", linewidth = .6, show.legend = FALSE) +
+  # 95% HDI bar on baseline
+  geom_segment(data = subset(summary_v_other, effect == "session"), aes(x = hdi_low, xend = hdi_high, y = y_seg, yend = y_seg, color = label), linewidth = 1.1, inherit.aes = FALSE) +
+  # facet labels with mean + HDI
+  geom_text(data = subset(summary_v_other, effect == "session"), aes(x = x_label, y = Inf, label = annot, color = label), vjust = 1.1, size = 2.5, show.legend = FALSE) +
+  scale_y_continuous(limits = c(-0.075, 1.1)) +
+  facet_wrap(~ type, scales = "free_x") +
+  labs(x = "Effect on drift v", y = "Posterior density") +
+  scale_color_manual(values = c("gray75","gray55")) + 
+  scale_fill_manual(values = c("gray75","gray55")) +
+  #scale_color_manual(values = c("tomato3", "indianred1", "grey62", "grey62")) +
+  #scale_fill_manual(values = c("tomato3", "indianred1", "grey62", "grey62")) +
+  theme_minimal(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    #axis.text.y = element_text(size = 8.5),
+    axis.text.x.bottom = element_text(size = 8.5))
+)
+ggsave(dual_task_v_session, file = here("Plots/HSSM/dual_task_v_session.pdf"), width = 45, height = 55, units = "mm")
+```
+
+
+## Boundary separation: Plotting posterior distributions
+```{r}
+df_a <- df_long2 %>% 
+  filter(param == "a")
+
+# compute summary stats (95% HDI, mean HDI) 
+summary_a <- df_a %>% 
+  group_by(effect, type, label) %>% 
+  summarise(
+    mean = mean(value),
+    hdi_obj = list(bayestestR::hdi(value, ci = 0.95)),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    hdi_low  = map_dbl(hdi_obj, ~ .x$CI_low),
+    hdi_high = map_dbl(hdi_obj, ~ .x$CI_high),
+    annot = sprintf("M = %.2f [%.2f, %.2f]", mean, hdi_low, hdi_high)
+  ) %>% 
+  select(-hdi_obj)
+
+# TMS and TASK ----
+stimType_order = c("Offline", "Offline+Online", "Offline.surprisal_2", "Offline+Online.surprisal_2")
+
+# subset for stim_type
+df_a_stimType <- subset(df_a, effect == "stim_type")
+df_a_stimType$label <- factor(df_a_stimType$label, levels = stimType_order, labels = c("Offline TMS", "Offline+Online TMS", "Offline TMS: Surprisal", "Offline+Online TMS: Surprisal"))
+df_a_stimType$type <- factor(df_a_stimType$type, levels = c("main_effect", "interaction"), labels = c("Main effect TMS", "Interaction TMS x Surprisal"))
+
+# subset for surprisal
+df_a_surp <- subset(df_a, effect == "surprisal")
+df_a_surp$label <- factor(df_a_surp$label, labels = "Surprisal")
+df_a_surp$type <- factor(
+  df_a_surp$type, 
+  levels = "main_effect", 
+  labels = "Main effect Surprisal"
+)
+
+# combined df for plotting
+df_a_combined <- bind_rows(df_a_stimType, df_a_surp)
+df_a_combined$type <- factor(df_a_combined$type, levels = c("Main effect TMS", "Main effect Surprisal", "Interaction TMS x Surprisal"))
+
+# subset summary stats
+
+# determine max density value for plotting
+# dens_peaks <- df_a %>%
+#   group_by(label, type) %>%
+#   summarise(
+#     max_density = max(density(value)$y),  # compute density on value
+#     .groups = "drop"
+#   )
+
+summary_a_stimType <- subset(summary_a, effect == "stim_type")
+#summary_a_stimType <- left_join(summary_a_stimType, dens_peaks)
+summary_a_stimType$label <- factor(summary_a_stimType$label, levels = stimType_order, labels = c("Offline TMS", "Offline+Online TMS", "Offline TMS: Surprisal", "Offline+Online TMS: Surprisal"))
+summary_a_stimType$type <- factor(summary_a_stimType$type, levels = c("main_effect", "interaction"), labels = c("Main effect TMS", "Interaction TMS x Surprisal"))
+
+summary_a_stimType <- summary_a_stimType %>% 
+  mutate(x_label = case_when(
+    label == "Offline TMS" ~ -0.18,
+    label == "Offline+Online TMS" ~ 0.075,
+    label == "Offline+Online TMS: Surprisal" ~ -0.012,
+    label == "Offline TMS: Surprisal" ~ 0.01,
+    TRUE ~ mean
+  ))
+
+summary_a_stimType$y_seg <- -0.045
+summary_a_stimType$y_seg[str_detect(summary_a_stimType$label, "Online")] <- -0.075
+
+# task summary
+summary_a_surp <- subset(summary_a, effect == "surprisal")
+#summary_a_surp <- summary_a_surp %>% 
+#  left_join(dens_peaks)
+summary_a_surp$label <- factor(summary_a_surp$label, labels = "Surprisal")
+summary_a_surp$type  <- factor(summary_a_surp$type, 
+                               levels = "main_effect", 
+                               labels = "Main effect Surprisal")
+
+summary_a_surp$x_label <- summary_a_surp$mean
+summary_a_surp$y_seg   <- -0.06
+
+# combined summary for plotting
+summary_a_combined <- bind_rows(summary_a_stimType, summary_a_surp)
+summary_a_combined$type <- factor(summary_a_combined$type, levels = c("Main effect TMS", "Main effect Surprisal", "Interaction TMS x Surprisal"))
+
+## PLOT ----
+(dual_task_a_TMS_task <- ggplot(df_a_combined, aes(x = value, fill = label, color = label)) +
+  geom_segment(aes(x = 0, xend = 0, y = -0.075, yend = 1), linetype = "dashed", color = "darkslategrey", linewidth = 0.5) + 
+  geom_density(aes(y = after_stat(scaled)), alpha = 0.6, colour = NA) +
+  # mean line
+  geom_segment(data = summary_a_combined, aes(x = mean, xend = mean, y = 0, yend = 1, color = label), linetype = "dashed", linewidth = 0.85, show.legend = FALSE) +
+  # 95% HDI bar on baseline
+  geom_segment(data = summary_a_combined, aes(x = hdi_low, xend = hdi_high, y = y_seg, yend = y_seg, color = label), linewidth = 1.1, inherit.aes = FALSE) +
+  # facet labels with mean + HDI
+  geom_text(data = summary_a_combined, aes(x = x_label, y = Inf, label = annot, color = label), vjust = 1.1, size = 2.5, show.legend = FALSE) +
+  scale_y_continuous(limits = c(-0.075, 1.1)) +
+  facet_wrap(~ type, scales = "free_x") +
+  labs(x = "Effect on decision boundary a", y = "Posterior density") +
+  scale_color_manual(values = cols_dual) +
+  scale_fill_manual(values = cols_dual) +
+  theme_minimal(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    #axis.text.y = element_text(size = 8.5),
+    axis.text.x.bottom = element_text(size = 8.5))
+)
+
+ggsave(dual_task_a_TMS_task, file = here("Plots/HSSM/dual_task_a_TMS_task.pdf"), width = 135, height = 55, units = "mm")
+
+# Other effects ----
+df_a_other <- subset(df_a, effect != "stim_type" & effect != "surprisal" & type == "main_effect" & effect != "other")
+df_a_other <- df_a_other %>% 
+  mutate(type = case_when(
+    effect == "is_trigger" ~ "Main effect Trigger",
+    effect == "session" ~ "Main effect Session",
+    effect == "time_from_onset_task" ~ "Main effect Time",
+    effect == "entropy" ~ "Main effect Entropy",
+    effect == "word_length" ~ "Main effect Word length",
+    effect == "frequency" ~ "Main effect Frequency",
+  ))
+
+summary_a_other <- subset(summary_a, effect != "stim_type" & effect != "surprisal" & type == "main_effect" & effect != "other")
+
+# determine max density value for plotting
+# dens_peaks <- df_a_other %>%
+#   group_by(label, type) %>%
+#   summarise(
+#     max_density = max(density(value)$y),  # compute density on value
+#     .groups = "drop"
+#   )
+
+summary_a_other <- summary_a_other %>% 
+  mutate(
+    type = case_when(
+      effect == "is_trigger" ~ "Main effect Trigger",
+      effect == "session" ~ "Main effect Session",
+      effect == "time_from_onset_task" ~ "Main effect Time",
+      effect == "entropy" ~ "Main effect Entropy",
+      effect == "word_length" ~ "Main effect Word length",
+      effect == "frequency" ~ "Main effect Frequency")) %>% 
+  #left_join(dens_peaks, by = c("label", "type")) %>% 
+  mutate(
+    y_seg = case_when(
+      str_detect(label, "2") ~ -0.045,
+      str_detect(label, "3") ~ -0.075,
+      TRUE ~ -0.06
+    ),
+    x_label = case_when(
+      label == "2" ~ -0.18,
+      label == "3" ~ -0.35,
+      TRUE ~ mean
+    )
+  )
+
+## PLOT ----
+(dual_task_a_other_effects <- ggplot(subset(df_a_other, effect != "session" & effect != "word_length"), aes(x = value, fill = label, color = label)) +
+  geom_segment(aes(x = 0, xend = 0, y = -0.075, yend = 1), linetype = "dashed", color = "darkslategrey", linewidth = 0.5) + 
+  geom_density(aes(y = after_stat(scaled)), alpha = 0.6, colour = NA) +
+  # mean line
+  geom_segment(data = subset(summary_a_other, effect != "session" & effect != "word_length"), aes(x = mean, xend = mean, y = 0, yend = 1, color = label), linetype = "dashed", linewidth = .85, show.legend = FALSE) +
+  # 95% HDI bar on baseline
+  geom_segment(data = subset(summary_a_other, effect != "session" & effect != "word_length"), aes(x = hdi_low, xend = hdi_high, y = y_seg, yend = y_seg, color = label), linewidth = 1.1, inherit.aes = FALSE) +
+  # facet labels with mean + HDI
+  geom_text(data = subset(summary_a_other, effect != "session" & effect != "word_length"), aes(x = x_label, y = Inf, label = annot, color = label), vjust = 1.1, size = 2.5, show.legend = FALSE) +
+  scale_y_continuous(limits = c(-0.075, 1.1)) +
+  facet_wrap(~ type, scales = "free_x", nrow = 1) +
+  labs(x = "Effect on decision boundary a", y = "Posterior density") +
+  scale_color_manual(values = c(rep("slategray", 4))) +
+  scale_fill_manual(values = c(rep("slategray", 4))) +
+  #scale_color_manual(values = c("tomato3", "indianred1", "grey62", "grey62", "grey62", "grey62", "grey62", "grey62")) +
+  #scale_fill_manual(values = c("tomato3", "indianred1", "grey62", "grey62", "grey62", "grey62", "grey62", "grey62")) +
+  theme_minimal(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    #axis.text.y = element_text(size = 8.5),
+    axis.text.x.bottom = element_text(size = 8.5))
+)
+
+ggsave(dual_task_a_other_effects, file = here("Plots/HSSM/dual_task_a_other_effects.pdf"), width = 135, height = 55, units = "mm")
+
+# session
+(dual_task_a_session <- ggplot(subset(df_a_other, effect == "session"), aes(x = value, fill = label, color = label)) +
+  geom_segment(aes(x = 0, xend = 0, y = -0.075, yend = 1), linetype = "dashed", color = "darkslategrey", ) + 
+  geom_density(aes(y = after_stat(scaled)), alpha = 0.6, colour = NA) +
+  # mean line
+  geom_segment(data = subset(summary_a_other, effect == "session"), aes(x = mean, xend = mean, y = 0, yend = 1, color = label), linetype = "dashed", linewidth = .6, show.legend = FALSE) +
+  # 95% HDI bar on baseline
+  geom_segment(data = subset(summary_a_other, effect == "session"), aes(x = hdi_low, xend = hdi_high, y = y_seg, yend = y_seg, color = label), linewidth = 1.1, inherit.aes = FALSE) +
+  # facet labels with mean + HDI
+  geom_text(data = subset(summary_a_other, effect == "session"), aes(x = x_label, y = Inf, label = annot, color = label), vjust = 1.1, size = 2.5, show.legend = FALSE) +
+  scale_y_continuous(limits = c(-0.075, 1.1)) +
+  facet_wrap(~ type, scales = "free_x") +
+  labs(x = "Effect on decision boundary a", y = "Posterior density") +
+  scale_color_manual(values = c("gray75","gray55")) + 
+  scale_fill_manual(values = c("gray75","gray55")) +
+  #scale_color_manual(values = c("tomato3", "indianred1", "grey62", "grey62")) +
+  #scale_fill_manual(values = c("tomato3", "indianred1", "grey62", "grey62")) +
+  theme_minimal(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    #axis.text.y = element_text(size = 8.5),
+    axis.text.x.bottom = element_text(size = 8.5))
+)
+ggsave(dual_task_a_session, file = here("Plots/HSSM/dual_task_a_session.pdf"), width = 45, height = 55, units = "mm")
+```
+
+## Reporting summary of posterior estimates
+```{r}
+pd_results <- df_long2 %>%
+  group_by(term, param, effect, label, type) %>%
+  summarise(
+    posterior_mean = mean(value),
+    hdi = hdi(value),
+    pd = p_direction(value),
+    p_map = p_map(value),
+    .groups = "drop"
+  )
+
+pd_results <- pd_results %>%
+  mutate(p_direction_as_p = pd_to_p(pd))
+
+# Prepare table for manuscript ----
+table_df <- df_long2 %>%
+  group_by(term, param, effect, label, type) %>%
+  summarise(
+    posterior_mean = mean(value),
+    ci_low = hdi(value)$CI_low,
+    ci_high = hdi(value)$CI_high,
+    pd = p_direction(value),
+    #p_map = p_map(value),
+    .groups = "drop"
+  ) %>%
+  arrange(param, desc(abs(posterior_mean))) %>%
+  mutate(
+    hdi_str = sprintf("[%.3f, %.3f]", ci_low, ci_high),
+    pd_str = sprintf("%.1f%%", as.numeric(pd) * 100)
+  ) %>%
+  select(param, label, effect, type, posterior_mean, hdi_str, pd_str)
+
+manuscript_table <- table_df %>%
+  filter(effect != "other") %>% 
+  gt(groupname_col = "param") %>%
+  cols_label(
+    effect = "Effect",
+    label = "Term",
+    type = "Type",
+    posterior_mean = "Posterior Mean",
+    hdi_str = "95% HDI",
+    pd_str = "pd",
+    #p_map = "p(MAP)"
+  ) %>%
+  fmt_number(columns = c(posterior_mean), decimals = 3) %>%
+  tab_header(title = "Posterior Estimates of HDDM Parameters") %>%
+  tab_source_note("Note. HDI = highest density interval; pd = probability of direction.") %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_row_groups()
+  ) %>%
+  opt_table_lines("none") %>%
+  tab_options(table.border.top.width = px(2), table.border.bottom.width = px(2))
+
+gtsave(manuscript_table, here("Model_tables/hddm_dual_task.docx"))
+```
+
+## Model comparison
+```{r}
+mc_dual_task <- read.csv(here("Raw_data/HSSM/model_comparison_dual_task_new.csv"))
+
+# calculate difference in waic relative to baseline model
+mc_dual_task <- mc_dual_task %>% 
+  mutate(elpd_diff2baseline =
+           elpd_waic[X == "Model 1"] - elpd_waic)
+
+# plot WAIC values
+(mc_dual_task_plot <- ggplot(mc_dual_task[mc_dual_task$X != "Model 1",], aes(x = reorder(X, elpd_waic), y = abs(elpd_diff2baseline))) +
+    geom_bar(stat = "identity", fill = "slategray3") +
+    geom_text(aes(label = round(abs(elpd_diff2baseline), 1)), hjust = -0.1, size = 2.8, y = 0) +
+    coord_flip() +
+    labs(x = "Model", y = "Δ WAIC vs baseline") +
+    scale_x_discrete(labels = c(
+      "Model 5" = "v and a",
+      "Model 7" = "v and t",
+      "Model 8" = "v and z",
+      "Model 3" = "v",
+      "Model 9" = "v, a, and t")) +
+    scale_y_continuous(breaks = c(0, 10000, 20000)) +
+    theme_bw(base_size = 9) +
+    theme(
+      text = element_text(family = "Helvetica"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      #plot.margin = unit(c(5.5, 10, 5.5, 5.5), "pt"),
+      axis.line = element_line(),
+      axis.title.y = element_blank(),
+      axis.text.y = element_text(size = 8),
+      axis.text.x.bottom = element_text(size = 8))
+)
+
+ggsave(mc_dual_task_plot, file = here("Plots/HSSM/mc_dual_task_plot.pdf"), width = 60, height = 60, units = "mm")
+
+# LOO ----
+mc_dual_task <- read.csv(here("Raw_data/HSSM/model_comparison_dual_task_loo.csv"))
+
+# calculate difference in waic relative to baseline model
+mc_dual_task <- mc_dual_task %>% 
+  mutate(elpd_diff2baseline =
+           elpd_loo[X == "Model 1"] - elpd_loo)
+
+
+# plot LOO values
+(mc_dual_task_plot <- ggplot(mc_dual_task[mc_dual_task$X != "Model 1",], aes(x = reorder(X, elpd_loo), y = abs(elpd_diff2baseline))) +
+    geom_bar(stat = "identity", fill = "slategray3") +
+    geom_text(aes(label = round(abs(elpd_diff2baseline), 1)), hjust = -0.1, size = 2.8, y = 0) +
+    coord_flip() +
+    labs(x = "Model", y = "Δ ELPD-LOO vs Baseline model") +
+    scale_x_discrete(labels = c(
+      "Model 5" = "v and a",
+      "Model 7" = "v and t",
+      "Model 8" = "v and z",
+      "Model 3" = "v",
+      "Model 9" = "v, a, and t")) +
+    scale_y_continuous(breaks = c(0, 10000, 20000)) +
+    theme_bw(base_size = 9) +
+    theme(
+      text = element_text(family = "Helvetica"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      #plot.margin = unit(c(5.5, 10, 5.5, 5.5), "pt"),
+      axis.line = element_line(),
+      axis.title.y = element_blank(),
+      axis.text.y = element_text(size = 8),
+      axis.text.x.bottom = element_text(size = 8))
+)
+
+ggsave(mc_dual_task_plot, file = here("Plots/HSSM/mc_dual_task.pdf"), width = 50, height = 45, units = "mm")
+```
+
+## Recover individual factor levels
+```{r}
+# Drift rate ----
+## TMS ----
+levels <- c("Sham", "Offline", "Offline+Online") 
+k <- length(levels)
+
+draws <- df_long2 %>%
+  filter(param == "v" &
+    # intercept (grand mean)
+    (effect == "other" & type == "main_effect" & label == "v_Intercept" |
+    # simple contrasts for task (within stim_type interactions, etc.)
+    effect == "stim_type" & type == "main_effect")) %>%
+  mutate(
+    level = case_when(
+      label == "v_Intercept" ~ "grand_mean",
+      TRUE ~ label)
+  ) %>%
+  select(chain, draw, level, value) %>% 
+  pivot_wider(id_cols = c(chain, draw),
+              names_from = level, 
+              values_from = value)
+
+draws_wide <- draws %>%
+  mutate(
+    # sum of simple-contrast coeffs (non-ref levels), per draw
+    beta_sum = rowSums(across(all_of(levels[-1])), na.rm = TRUE),
+    
+    # reference level (baseline) per draw
+    !!levels[1] := grand_mean - beta_sum / k,
+    
+    # non-reference levels per draw: reference + their contrast
+    across(
+      all_of(levels[-1]),
+      ~ .data[[levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+draws <- draws_wide %>%
+  select(chain, draw, all_of(levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "level",
+    values_to = "value") %>%
+  mutate(
+    level = str_remove(level, "_abs$"))
+
+summary_TMS <- draws %>%
+  group_by(level) %>%
+  mean_hdi(value, .width = 0.95) %>%
+  transmute(
+    effect   = "stim_type",
+    type     = "reconstructed",
+    label    = level,
+    mean     = value,
+    hdi_low  = .lower,
+    hdi_high = .upper)
+
+## TMS x Surprisal interaction ----
+tms_levels <- c("Sham", "Offline", "Offline+Online")
+k_tms <- length(tms_levels)
+
+c_grid <- tibble(c_pred = seq(0, 40, length.out = 41))  # adjust as needed
+
+
+# 1) grand mean + continuous main slope + TMS main effects
+base_draws <- df_long2 %>%
+  filter(
+    param == "v" &
+      (
+        effect == "other"    & type == "main_effect" & label == "v_Intercept" |
+        effect == "surprisal"   & type == "main_effect" |
+        effect == "stim_type" & type == "main_effect"
+      )
+  ) %>%
+  mutate(
+    level = case_when(
+      label == "v_Intercept" ~ "grand_mean",
+      effect == "surprisal"     ~ "surprisal",
+      TRUE                   ~ label           # TMS contrast labels
+    )
+  ) %>%
+  select(chain, draw, level, value) %>%
+  pivot_wider(
+    id_cols    = c(chain, draw),
+    names_from = level,
+    values_from = value
+  )
+
+# 2) reconstruct absolute TMS intercepts at c_pred = 0
+#    same logic as your task example
+base_draws <- base_draws %>%
+  mutate(
+    beta_tms_sum = rowSums(across(all_of(tms_levels[-1])), na.rm = TRUE),
+    !!tms_levels[1] := grand_mean - beta_tms_sum / k_tms,
+    across(
+      all_of(tms_levels[-1]),
+      ~ .data[[tms_levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+tms_intercept_draws <- base_draws %>%
+  select(chain, draw, all_of(tms_levels[1]), ends_with("_abs"), surprisal) %>%
+  pivot_longer(
+    cols = c(all_of(tms_levels[1]), ends_with("_abs")),
+    names_to = "tms",
+    values_to = "mu0_tms"
+  ) %>%
+  mutate(
+    tms = str_remove(tms, "_abs$")
+  )
+
+# 3) extract TMS x continuous interactions
+#    these are deviations of slope from the reference/implicit TMS slope
+cint_draws <- df_long2 %>%
+  filter(
+    param == "v",
+    effect == "stim_type",
+    type   == "interaction",
+    str_detect(label, "surprisal_2")      # ADJUST IF NEEDED
+  ) %>%
+  mutate(
+    tms = str_remove(label, "\\surprisal_2*$"),   # ADJUST IF NEEDED
+    tms = str_remove(tms, ":surprisal_2*$"),       # ADJUST IF NEEDED
+    tms = str_remove(tms, "\\*surprisal_2*$")      # ADJUST IF NEEDED
+  ) %>%
+  select(chain, draw, tms, value)
+
+# 4) reconstruct absolute TMS-specific slopes
+#    same logic as intercept reconstruction
+slope_draws <- cint_draws %>%
+  pivot_wider(
+    id_cols    = c(chain, draw),
+    names_from = tms,
+    values_from = value
+  ) %>%
+  right_join(
+    base_draws %>% select(chain, draw, surprisal),
+    by = c("chain", "draw")
+  )
+
+# ensure expected columns exist even if some are absent
+for (nm in tms_levels[-1]) {
+  if (!nm %in% names(slope_draws)) {
+    slope_draws[[nm]] <- NA_real_
+  }
+}
+
+slope_draws <- slope_draws %>%
+  mutate(
+    beta_slope_sum = rowSums(across(all_of(tms_levels[-1])), na.rm = TRUE),
+    !!tms_levels[1] := surprisal - beta_slope_sum / k_tms,
+    across(
+      all_of(tms_levels[-1]),
+      ~ .data[[tms_levels[1]]] + coalesce(., 0),
+      .names = "{col}_abs"
+    )
+  )
+
+tms_slope_draws <- slope_draws %>%
+  select(chain, draw, all_of(tms_levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "tms",
+    values_to = "beta_c_tms"
+  ) %>%
+  mutate(
+    tms = str_remove(tms, "_abs$")
+  )
+
+# 5) combine absolute intercepts + slopes and evaluate over c_pred grid
+cont_tms_draws <- tms_intercept_draws %>%
+  select(chain, draw, tms, mu0_tms) %>%
+  left_join(
+    tms_slope_draws,
+    by = c("chain", "draw", "tms")
+  ) %>%
+  crossing(c_pred = c_grid$c_pred) %>%
+  mutate(
+    mu_tms_c = mu0_tms + beta_c_tms * c_pred
+  )
+
+# 6) summarize
+summary_tms_surprisal_v <- cont_tms_draws %>%
+  group_by(tms, c_pred) %>%
+  mean_hdi(mu_tms_c, .width = 0.95) %>%
+  transmute(
+    effect   = "stim_type",
+    type     = "reconstructed",
+    label    = paste0(tms, " × surprisal_2=", round(c_pred, 2)),
+    tms      = tms,
+    c_pred   = c_pred,
+    mean     = mu_tms_c,
+    hdi_low  = .lower,
+    hdi_high = .upper
+  )
+
+
+## Trigger ----
+levels <- c("False", "True") 
+k <- length(levels)
+
+draws <- df_long2 %>%
+  filter(param == "v" &
+    # intercept (grand mean)
+    (effect == "other" & type == "main_effect" & label == "v_Intercept" |
+    # simple contrasts for task (within stim_type interactions, etc.)
+    effect == "is_trigger" & type == "main_effect")) %>%
+  mutate(
+    level = case_when(
+      label == "v_Intercept" ~ "grand_mean",
+      TRUE ~ label)
+  ) %>%
+  select(chain, draw, level, value) %>% 
+  pivot_wider(id_cols = c(chain, draw),
+              names_from = level, 
+              values_from = value)
+
+draws_wide <- draws %>%
+  mutate(
+    # sum of simple-contrast coeffs (non-ref levels), per draw
+    beta_sum = rowSums(across(all_of(levels[-1])), na.rm = TRUE),
+    
+    # reference level (baseline) per draw
+    !!levels[1] := grand_mean - beta_sum / k,
+    
+    # non-reference levels per draw: reference + their contrast
+    across(
+      all_of(levels[-1]),
+      ~ .data[[levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+draws <- draws_wide %>%
+  select(chain, draw, all_of(levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "level",
+    values_to = "value") %>%
+  mutate(
+    level = str_remove(level, "_abs$"))
+
+summary_trigger <- draws %>%
+  group_by(level) %>%
+  mean_hdi(value, .width = 0.95) %>%
+  transmute(
+    effect   = "trigger",
+    type     = "reconstructed",
+    label    = level,
+    mean     = value,
+    hdi_low  = .lower,
+    hdi_high = .upper)
+
+## Session ----
+levels <- c("1", "2", "3") 
+k <- length(levels)
+
+draws <- df_long2 %>%
+  filter(param == "v" &
+    # intercept (grand mean)
+    (effect == "other" & type == "main_effect" & label == "v_Intercept" |
+    # simple contrasts for task (within stim_type interactions, etc.)
+    effect == "session")) %>%
+  mutate(
+    level = case_when(
+      label == "v_Intercept" ~ "grand_mean",
+      TRUE ~ label)
+  ) %>%
+  select(chain, draw, level, value) %>% 
+  pivot_wider(id_cols = c(chain, draw),
+              names_from = level, 
+              values_from = value)
+
+draws_wide <- draws %>%
+  mutate(
+    # sum of simple-contrast coeffs (non-ref levels), per draw
+    beta_sum = rowSums(across(all_of(levels[-1])), na.rm = TRUE),
+    
+    # reference level (baseline) per draw
+    !!levels[1] := grand_mean - beta_sum / k,
+    
+    # non-reference levels per draw: reference + their contrast
+    across(
+      all_of(levels[-1]),
+      ~ .data[[levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+draws <- draws_wide %>%
+  select(chain, draw, all_of(levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "level",
+    values_to = "value") %>%
+  mutate(
+    level = str_remove(level, "_abs$"))
+
+summary_session <- draws %>%
+  group_by(level) %>%
+  mean_hdi(value, .width = 0.95) %>%
+  transmute(
+    effect   = "session",
+    type     = "reconstructed",
+    label    = level,
+    mean     = value,
+    hdi_low  = .lower,
+    hdi_high = .upper)
+
+# Merge all parameters into one df
+df_indiv_parameters_v <- rbind(summary_TMS, summary_session, summary_trigger)
+
+
+# Decision boundary ----
+## TMS ----
+levels <- c("Sham", "Offline", "Offline+Online") 
+k <- length(levels)
+
+draws <- df_long2 %>%
+  filter(param == "a" &
+    # intercept (grand mean)
+    (effect == "other" & type == "main_effect" & label == "a_Intercept" |
+    # simple contrasts for task (within stim_type interactions, etc.)
+    effect == "stim_type" & type == "main_effect")) %>%
+  mutate(
+    level = case_when(
+      label == "a_Intercept" ~ "grand_mean",
+      TRUE ~ label)
+  ) %>%
+  select(chain, draw, level, value) %>% 
+  pivot_wider(id_cols = c(chain, draw),
+              names_from = level, 
+              values_from = value)
+
+draws_wide <- draws %>%
+  mutate(
+    # sum of simple-contrast coeffs (non-ref levels), per draw
+    beta_sum = rowSums(across(all_of(levels[-1])), na.rm = TRUE),
+    
+    # reference level (baseline) per draw
+    !!levels[1] := grand_mean - beta_sum / k,
+    
+    # non-reference levels per draw: reference + their contrast
+    across(
+      all_of(levels[-1]),
+      ~ .data[[levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+draws <- draws_wide %>%
+  select(chain, draw, all_of(levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "level",
+    values_to = "value") %>%
+  mutate(
+    level = str_remove(level, "_abs$"))
+
+summary_TMS <- draws %>%
+  group_by(level) %>%
+  mean_hdi(value, .width = 0.95) %>%
+  transmute(
+    effect   = "stim_type",
+    type     = "reconstructed",
+    label    = level,
+    mean     = value,
+    hdi_low  = .lower,
+    hdi_high = .upper)
+
+## TMS x Surprisal interaction ----
+tms_levels <- c("Sham", "Offline", "Offline+Online")
+k_tms <- length(tms_levels)
+
+c_grid <- tibble(c_pred = seq(0, 40, length.out = 41))  # adjust as needed
+
+
+# 1) grand mean + continuous main slope + TMS main effects
+base_draws <- df_long2 %>%
+  filter(
+    param == "a" &
+      (
+        effect == "other"    & type == "main_effect" & label == "a_Intercept" |
+        effect == "surprisal"   & type == "main_effect" |
+        effect == "stim_type" & type == "main_effect"
+      )
+  ) %>%
+  mutate(
+    level = case_when(
+      label == "a_Intercept" ~ "grand_mean",
+      effect == "surprisal"     ~ "surprisal",   
+      TRUE                   ~ label           # TMS contrast labels
+    )
+  ) %>%
+  select(chain, draw, level, value) %>%
+  pivot_wider(
+    id_cols    = c(chain, draw),
+    names_from = level,
+    values_from = value
+  )
+
+# 2) reconstruct absolute TMS intercepts at c_pred = 0
+#    same logic as your task example
+base_draws <- base_draws %>%
+  mutate(
+    beta_tms_sum = rowSums(across(all_of(tms_levels[-1])), na.rm = TRUE),
+    !!tms_levels[1] := grand_mean - beta_tms_sum / k_tms,
+    across(
+      all_of(tms_levels[-1]),
+      ~ .data[[tms_levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+tms_intercept_draws <- base_draws %>%
+  select(chain, draw, all_of(tms_levels[1]), ends_with("_abs"), surprisal) %>%
+  pivot_longer(
+    cols = c(all_of(tms_levels[1]), ends_with("_abs")),
+    names_to = "tms",
+    values_to = "mu0_tms"
+  ) %>%
+  mutate(
+    tms = str_remove(tms, "_abs$")
+  )
+
+# 3) extract TMS x continuous interactions
+#    these are deviations of slope from the reference/implicit TMS slope
+cint_draws <- df_long2 %>%
+  filter(
+    param == "a",
+    effect == "stim_type",
+    type   == "interaction",
+    str_detect(label, "surprisal_2")     
+  ) %>%
+  mutate(
+    tms = str_remove(label, "\\surprisal_2*$"),  
+    tms = str_remove(tms, ":surprisal_2*$"),      
+    tms = str_remove(tms, "\\*surprisal_2*$")    
+  ) %>%
+  select(chain, draw, tms, value)
+
+# 4) reconstruct absolute TMS-specific slopes
+#    same logic as intercept reconstruction
+slope_draws <- cint_draws %>%
+  pivot_wider(
+    id_cols    = c(chain, draw),
+    names_from = tms,
+    values_from = value
+  ) %>%
+  right_join(
+    base_draws %>% select(chain, draw, surprisal),
+    by = c("chain", "draw")
+  )
+
+# ensure expected columns exist even if some are absent
+for (nm in tms_levels[-1]) {
+  if (!nm %in% names(slope_draws)) {
+    slope_draws[[nm]] <- NA_real_
+  }
+}
+
+slope_draws <- slope_draws %>%
+  mutate(
+    beta_slope_sum = rowSums(across(all_of(tms_levels[-1])), na.rm = TRUE),
+    !!tms_levels[1] := surprisal - beta_slope_sum / k_tms,
+    across(
+      all_of(tms_levels[-1]),
+      ~ .data[[tms_levels[1]]] + coalesce(., 0),
+      .names = "{col}_abs"
+    )
+  )
+
+tms_slope_draws <- slope_draws %>%
+  select(chain, draw, all_of(tms_levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "tms",
+    values_to = "beta_c_tms"
+  ) %>%
+  mutate(
+    tms = str_remove(tms, "_abs$")
+  )
+
+# 5) combine absolute intercepts + slopes and evaluate over c_pred grid
+cont_tms_draws <- tms_intercept_draws %>%
+  select(chain, draw, tms, mu0_tms) %>%
+  left_join(
+    tms_slope_draws,
+    by = c("chain", "draw", "tms")
+  ) %>%
+  crossing(c_pred = c_grid$c_pred) %>%
+  mutate(
+    mu_tms_c = mu0_tms + beta_c_tms * c_pred
+  )
+
+# 6) summarize
+summary_tms_surprisal_a <- cont_tms_draws %>%
+  group_by(tms, c_pred) %>%
+  mean_hdi(mu_tms_c, .width = 0.95) %>%
+  transmute(
+    effect   = "stim_type",
+    type     = "reconstructed",
+    label    = paste0(tms, " × surprisal_2=", round(c_pred, 2)),
+    tms      = tms,
+    c_pred   = c_pred,
+    mean     = mu_tms_c,
+    hdi_low  = .lower,
+    hdi_high = .upper
+  )
+
+
+## Trigger ----
+levels <- c("False", "True") 
+k <- length(levels)
+
+draws <- df_long2 %>%
+  filter(param == "a" &
+    # intercept (grand mean)
+    (effect == "other" & type == "main_effect" & label == "a_Intercept" |
+    # simple contrasts for task (within stim_type interactions, etc.)
+    effect == "is_trigger" & type == "main_effect")) %>%
+  mutate(
+    level = case_when(
+      label == "a_Intercept" ~ "grand_mean",
+      TRUE ~ label)
+  ) %>%
+  select(chain, draw, level, value) %>% 
+  pivot_wider(id_cols = c(chain, draw),
+              names_from = level, 
+              values_from = value)
+
+draws_wide <- draws %>%
+  mutate(
+    # sum of simple-contrast coeffs (non-ref levels), per draw
+    beta_sum = rowSums(across(all_of(levels[-1])), na.rm = TRUE),
+    
+    # reference level (baseline) per draw
+    !!levels[1] := grand_mean - beta_sum / k,
+    
+    # non-reference levels per draw: reference + their contrast
+    across(
+      all_of(levels[-1]),
+      ~ .data[[levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+draws <- draws_wide %>%
+  select(chain, draw, all_of(levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "level",
+    values_to = "value") %>%
+  mutate(
+    level = str_remove(level, "_abs$"))
+
+summary_trigger <- draws %>%
+  group_by(level) %>%
+  mean_hdi(value, .width = 0.95) %>%
+  transmute(
+    effect   = "trigger",
+    type     = "reconstructed",
+    label    = level,
+    mean     = value,
+    hdi_low  = .lower,
+    hdi_high = .upper)
+
+
+## Session ----
+levels <- c("1", "2", "3") 
+k <- length(levels)
+
+draws <- df_long2 %>%
+  filter(param == "a" &
+    # intercept (grand mean)
+    (effect == "other" & type == "main_effect" & label == "a_Intercept" |
+    # simple contrasts for task (within stim_type interactions, etc.)
+    effect == "session")) %>%
+  mutate(
+    level = case_when(
+      label == "a_Intercept" ~ "grand_mean",
+      TRUE ~ label)
+  ) %>%
+  select(chain, draw, level, value) %>% 
+  pivot_wider(id_cols = c(chain, draw),
+              names_from = level, 
+              values_from = value)
+
+draws_wide <- draws %>%
+  mutate(
+    # sum of simple-contrast coeffs (non-ref levels), per draw
+    beta_sum = rowSums(across(all_of(levels[-1])), na.rm = TRUE),
+    
+    # reference level (baseline) per draw
+    !!levels[1] := grand_mean - beta_sum / k,
+    
+    # non-reference levels per draw: reference + their contrast
+    across(
+      all_of(levels[-1]),
+      ~ .data[[levels[1]]] + .,
+      .names = "{col}_abs"
+    )
+  )
+
+draws <- draws_wide %>%
+  select(chain, draw, all_of(levels[1]), ends_with("_abs")) %>%
+  pivot_longer(
+    cols = -c(chain, draw),
+    names_to = "level",
+    values_to = "value") %>%
+  mutate(
+    level = str_remove(level, "_abs$"))
+
+summary_session <- draws %>%
+  group_by(level) %>%
+  mean_hdi(value, .width = 0.95) %>%
+  transmute(
+    effect   = "session",
+    type     = "reconstructed",
+    label    = level,
+    mean     = value,
+    hdi_low  = .lower,
+    hdi_high = .upper)
+
+# Merge all parameters into one df
+df_indiv_parameters_a <- rbind(summary_TMS, summary_session, summary_trigger)
+
+# Merge dfs for v and a
+df_indiv_parameters_v$parameter <- "v"
+df_indiv_parameters_a$parameter <- "a"
+
+df_indiv_parameters_dual_task <- full_join(df_indiv_parameters_v, df_indiv_parameters_a)
+df_indiv_parameters_dual_task <- df_indiv_parameters_dual_task %>% 
+  mutate(type = case_when(
+    str_detect(label, "×") ~ "interaction",
+    TRUE ~ "main_effect"
+  ))
+
+saveRDS(df_indiv_parameters_dual_task, file = here("RData/HSSM/df_indiv_parameters_dual_task.rds"))
+```
+
+### Plot level-specific parameters
+```{r}
+# Drift rate v ----
+df_v <- df_indiv_parameters_dual_task %>% 
+  filter(parameter == "v" & effect != "session" & effect != "trigger")
+
+df_v$label <- factor(df_v$label, levels = c("Sham","Offline","Offline+Online"))
+
+## Plot ----
+(dual_task_indiv_params_v <- ggplot(df_v, aes(x = label, y = mean, colour = label)) +
+  geom_errorbar(aes(ymin = hdi_low, ymax = hdi_high), width = 0.25, linewidth = 0.5) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(breaks = c(0, 1, 2), limits = c(0, 2)) +
+  scale_color_manual(values = cols_dual_indiv_params) +
+  scale_fill_manual(values = cols_dual_indiv_params) +
+  facet_wrap(~ effect + type, scales = "free_x", axes = "all", space = "free_x") +
+  theme_bw(base_size = 5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.x = element_blank(),
+    #axis.text.y = element_blank(),
+    axis.text.y = element_text(size = 5),
+    axis.text.x.bottom = element_text(size = 5, hjust = 1, vjust = 1, angle = 45))
+)
+
+ggsave(dual_task_indiv_params_v, file = here("Plots/HSSM/dual_task_indiv_params_v.pdf"), width = 17, height = 30, units = "mm")
+
+# separate plot for trigger
+df <- df_indiv_parameters %>% 
+  filter(effect == "trigger")
+
+df$label <- factor(df$label, levels = c("False","True"))
+
+## Plot ----
+(dual_task_indiv_params_trigger <- ggplot(df, aes(x = label, y = mean, colour = label)) +
+  geom_errorbar(aes(ymin = hdi_low, ymax = hdi_high), width = 0.25, linewidth = 0.5) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  #scale_y_continuous(breaks = c(0, 1, 2), limits = c(-0.5, 2.3)) +
+  scale_color_manual(values = c("slategray2", "slategrey")) +
+  scale_fill_manual(values = c("slategray2", "slategrey")) +
+  facet_wrap(~ parameter, scales = "free", axes = "all", space = "free_x") +
+  theme_bw(base_size = 5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.x = element_blank(),
+    #axis.text.y = element_blank(),
+    axis.text.y = element_text(size = 5),
+    axis.text.x.bottom = element_text(size = 5, hjust = 1, vjust = 1, angle = 45))
+)
+
+ggsave(dual_task_indiv_params_trigger, file = here("Plots/HSSM/dual_task_indiv_params_trigger.pdf"), width = 35, height = 30, units = "mm")
+
+# separate plot for TMS x surprisal
+summary_tms_surprisal_v$parameter <- "v"
+summary_tms_surprisal_a$parameter <- "a"
+summary_tms_surprisal <- full_join(summary_tms_surprisal_v, summary_tms_surprisal_a)
+
+summary_tms_surprisal$tms <- factor(summary_tms_surprisal$tms, levels = c("Sham","Offline","Offline+Online"))
+
+## Plot ----
+(dual_task_indiv_params_tms_surprisal <- ggplot(summary_tms_surprisal, aes(x = c_pred, y = mean, colour = tms, fill = tms)) +
+  geom_ribbon(aes(ymin = hdi_low, ymax = hdi_high), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1.1) +
+  #geom_errorbar(aes(ymin = hdi_low, ymax = hdi_high), width = 0.25, linewidth = 0.5) +
+  #geom_point(size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(breaks = c(0, 1, 2), limits = c(-0.5, 2)) +
+  scale_color_manual(values = cols_dual_indiv_params[4:6]) +
+  scale_fill_manual(values = cols_dual_indiv_params[4:6]) +
+  facet_wrap(~ parameter, axes = "all", space = "free_x") +
+  theme_bw(base_size = 5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.x = element_blank(),
+    #axis.text.y = element_blank(),
+    axis.text.y = element_text(size = 5),
+    axis.text.x.bottom = element_text(size = 5))
+)
+
+ggsave(dual_task_indiv_params_tms_surprisal, file = here("Plots/HSSM/dual_task_indiv_params_tms_surprisal.pdf"), width = 35, height = 30, units = "mm")
+
+
+# Decision boundary a ----
+df_a <- df_indiv_parameters_dual_task %>% 
+  filter(parameter == "a" & effect != "session" & effect != "trigger")
+
+df_a$label <- factor(df_a$label, levels = c("Sham","Offline","Offline+Online"))
+
+## Plot ----
+(dual_task_indiv_params_a <- ggplot(df_a, aes(x = label, y = mean, colour = label)) +
+  geom_errorbar(aes(ymin = hdi_low, ymax = hdi_high), width = 0.25, linewidth = 0.5) +
+  geom_point(size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_y_continuous(breaks = c(-0.25, 0, 0.25), limits = c(-0.5, 0.25)) +
+  scale_color_manual(values = cols_dual_indiv_params) +
+  scale_fill_manual(values = cols_dual_indiv_params) +
+  facet_wrap(~ effect + type, scales = "free_x", axes = "all", space = "free_x") +
+  theme_bw(base_size = 5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_blank(),
+    axis.line.x = element_line(),
+    axis.ticks.x = element_line(),
+    axis.title.x = element_blank(),
+    #axis.text.y = element_blank(),
+    axis.text.y = element_text(size = 5),
+    axis.text.x.bottom = element_text(size = 5, hjust = 1, vjust = 1, angle = 45))
+)
+
+ggsave(dual_task_indiv_params_a, file = here("Plots/HSSM/dual_task_indiv_params_a.pdf"), width = 20, height = 30, units = "mm")
+```
+
+## Subject-specific parameters
+```{r}
+df_subject_parameters_nback <- read.csv(here("Raw_data/HSSM/nback_va_int_subject_params.csv"), header = TRUE, sep = ",")
+df_subject_parameters_nback <- df_subject_parameters_nback[,2:length(df_subject_parameters_nback)]
+
+(plot_subject_params <- ggplot(df_subject_parameters_nback, aes(x = parameter, y = mean, fill = parameter, color = parameter)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "darkslategrey") + 
+    geom_violinhalf(color = NA, position = position_nudge(x = 0.025)) +
+    geom_jitter2(position = position_nudge(x = -0.025)) +
+    theme_bw(base_size = 9.5) +
+  theme(
+    legend.position = "bottom",
+    text = element_text(family = "Helvetica"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    plot.margin = unit(c(5.5, 10, 5.5, 5.5), "pt"),
+    axis.line = element_line(),
+    axis.text.y = element_text(size = 8.5),
+    axis.text.x.bottom = element_text(size = 8.5, hjust = 1, vjust = 1, angle = 45))
+)
+```
+
+
+
+
+
+# Test for continuous predictors
+```{r}
+library(tidyverse)
+
+dual_task_nback <- read.csv(here("Raw_data/HSSM/dual_task_va_int.csv"), sep = ",")
+
+dual_task_nback <- dual_task_nback %>% 
+  rename("v_stim_type_simp_Offline+Online.surprisal_2" = "v_stim_type_simp_Offline...Online.surprisal_2",
+         "v_stim_type_simp_Offline+Online" =  "v_stim_type_simp_Offline...Online",
+         "a_stim_type_simp_Offline+Online.surprisal_2" = "a_stim_type_simp_Offline...Online.surprisal_2",
+         "a_stim_type_simp_Offline+Online" =  "a_stim_type_simp_Offline...Online",
+         )
+
+
+intercept_name <- "v_Intercept"
+slope_name <- "v_surprisal_2"
+
+x_grid <- seq(0, 35, length.out = 100)
+
+plot_df <- map_dfr(x_grid, function(x) {
+  v <- dual_task_nback[[intercept_name]] + dual_task_nback[[slope_name]] * x
+  tibble(
+    x = x,
+    mean = mean(v),
+    median = median(v),
+    hdi_low = quantile(v, 0.025),
+    hdi_high = quantile(v, 0.975)
+  )
+})
+
+ggplot(plot_df, aes(x = x, y = mean)) +
+  geom_ribbon(aes(ymin = hdi_low, ymax = hdi_high), fill = cols_dual[5], alpha = 0.3) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+  labs(
+    x = "Surprisal",
+    y = "Predicted drift rate v",
+    title = "Effect of surprisal on drift rate"
+  ) +
+  theme_classic()
+```
+
