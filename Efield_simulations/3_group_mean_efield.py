@@ -1,8 +1,9 @@
 import os
 import pandas as pd
 import numpy as np
-from simnibs import localite, read_msh
-import gmsh
+from simnibs import localite, transformations
+import nibabel as nib
+import meshio
 
 # Define paths
 base_dir = "/data/p_03049/MRI_TMS_Data/"
@@ -10,108 +11,101 @@ target_dir_efields = "/data/p_03049/Results/E-field_simulations"
 
 # Define list of subjects
 subs = os.listdir(base_dir)
+subs.sort()
 
 # Read file with subject and session info
-stim_dir = "/data/p_03049/Scripts/TMS_simulation/EXNAT_4_TMS_session_info.txt"
-stim_intensity = pd.read_csv(stim_dir, sep="\t")
+stim_intensity = pd.read_csv("/data/p_03049/EXNAT_4_TMS/Efield_simulations/EXNAT_4_TMS_session_info.txt", sep="\t")
 
 # Define n of sessions
 sessions = ("offline", "offline_online")  # "sham"
 
 # Load simulation results
-results_folder = "efield_sim_{0}/fsavg_overlays"
-fsavg_msh_name = "{0}_TMS_1-000{1}_MagVenture_MCF-B65_new_scalar_fsavg.msh"
+depth = 0.99
+# depth = 0.5
+# results_folder = "efield_sim_{0}/fsavg_overlays"
+fsavg_msh_name = "{0}_TMS_1-000{1}_MagVenture_MCF-B65_new_scalar_fsavg.E.magn"
 field_name = 'E_magn'
 
-fields = {'offline': {'AG': []}, 'online': {'AG': [], 'DLPFC': []}}
+fields = {'offline':
+              {'AG': []},
+          'online':
+              {'AG':[],
+               'DLPFC': []
+               }
+          }
 
-for sess in ['offline', 'offline_online']:
-    for sub in subs:
-        if "sub-" not in sub:
-            continue
-        print(sub, "and", sess)
-        sub_dir = os.path.join(base_dir, sub)
+# which surface for plotting - pial, inflated, etc.
+surf = 'pial'
+surf = 'inflated0030'
+surf = 'inflated0015'
+surf = 'pial_inflated0015'
 
-        marker_col = sess + "_marker_file"
-        marker_file = stim_intensity.loc[stim_intensity.participant == sub, marker_col].iloc[0]
-        tms_list = localite().read(marker_file)
+output_folder = "/data/p_03049/Results/E-field_simulations/fsaverage"
+fs_average_subject_folder = "/data/p_03049/EXNAT_4_TMS/Efield_simulations/fsavg_geometry/"
+for hem in ['lh','rh']:
+    coords, faces = nib.freesurfer.read_geometry(f"{fs_average_subject_folder}/{hem}.{surf}")
+    for sess in ['offline', 'offline_online']:
+        for sub in subs:
+            if "sub-" not in sub:
+                continue
+            print(sub, "and", sess)
+            sub_dir = os.path.join(base_dir, sub)
 
-        if sess == "offline":
-            target_list = [i for i in tms_list.pos if i.name == "AG"]
-        else:  # offline_online
-            target_list = [i for i in tms_list.pos if i.name in ("AG", "DLPFC")]
+            marker_col = sess + "_marker_file"
+            marker_file = stim_intensity.loc[stim_intensity.participant == sub, marker_col].iloc[0]
+            try:
+                tms_list = localite().read(marker_file)
+            except AssertionError as e:
+                print(e)
+                continue
 
-        for idx, target in enumerate(target_list):
-            mesh_idx = idx + 1
-            msh_path = os.path.join(
-                sub_dir,
-                results_folder.format(sess),
-                fsavg_msh_name.format(sub, mesh_idx)
-            )
+            if sess == "offline":
+                target_list = [i for i in tms_list.pos if i.name == "AG"]
+            else:  # offline_online
+                target_list = [i for i in tms_list.pos if i.name in ("AG", "DLPFC")]
 
-            # Read mesh and extract subject's own efield
-            results_fsavg = read_msh(msh_path)
+            for idx, target in enumerate(target_list):
+                out_folder = f"{sub_dir}/efield_sim_{sess}/subject_overlays_{depth}/"
+                out_fsavg = f"{sub_dir}/efield_sim_{sess}/fsavg_overlays_{depth}/"
+                mesh_idx = idx + 1
+                msh_path = (f"{sub_dir}/"
+                            f"efield_sim_{sess}/fsavg_overlays_{depth}/"
+                            f"{hem}.{sub}_TMS_1-000{mesh_idx}_MagVenture_MCF-B65_new_scalar.fsavg.E.magn")
+                if not os.path.exists(out_fsavg) or not os.path.exists(msh_path):
+                    print(f"\tCreating fsaverage with depth = {depth}")
+                    subpath = f"/data/p_03049/MRI_TMS_Data/{sub}/m2m_{sub}"
 
-            # Append efield values to dict
-            sess_key = 'offline' if target.name == 'AG' and sess == 'offline' else 'online'
-            fields[sess_key][target.name].append(results_fsavg.field[field_name].value)
-
-            #results_fsavg.write(os.path.join(target_dir_efields, f"{sess_key}_{target}.msh")) --> not sure this is the correct way to save a mesh
-
-# group_fields = pd.DataFrame(fields, columns=["sub", "sess", "site", "Emagn"])
-# group_fields.to_csv(os.path.join(base_dir, "group_fields.txt"), index = False, sep = "\t")
-
-## Calculate and plot averages
-for session in fields:
-    for target in fields[session]:
-        mesh_fields = np.vstack(fields[session][target])
-        avg_field = np.mean(mesh_fields, axis=0)
-        std_field = np.std(mesh_fields, axis=0)
-
-        results_fsavg.nodedata = []  # cleanup fields
-        # Add node fields for the average and std deviation
-        results_fsavg.add_node_field(avg_field, 'E_magn_avg')
-        results_fsavg.add_node_field(std_field, 'E_magn_std')
-
-        print(f"Showing for {session} - {target}")
-        results_fsavg.view(visible_fields='E_magn_avg').show()
+                    f = f"/data/p_03049/MRI_TMS_Data/{sub}/efield_sim_{sess}/{sub}_TMS_1-000{mesh_idx}_MagVenture_MCF-B65_new_scalar.msh"
+                    f_geo = f.replace("scalar.msh","coil_pos.geo")
+                    transformations.middle_gm_interpolation(
+                            f, subpath, out_folder,
+                            out_fsaverage=out_fsavg, depth=depth,
+                            open_in_gmsh=False, f_geo=f_geo)
 
 
 
-# for sub in subs:
-#     if "sub-" in sub:
-#         # read mesh with results transformed to fsaverage space
-#         results_fsavg = simnibs.read_msh(
-#             os.path.join(base_dir, sub, results_folder, fsavg_msh_name.format(sub))
-#         )
-#         # save the field in each subject
-#         fields.append(results_fsavg.field[field_name].value)
-#
-# ## Calculate and plot averages
-# # Calculate
-# fields = np.vstack(fields)
-# avg_field = np.mean(fields, axis=0)
-# std_field = np.std(fields, axis=0)
-#
-# # Plot
-# results_fsavg.nodedata = [] # cleanup fields
-# results_fsavg.add_node_field(avg_field, 'E_magn_avg') # add average field
-# results_fsavg.add_node_field(std_field, 'E_magn_std') # add std field
-#
-# # show surface with the fields
-# results_fsavg.view(visible_fields='E_magn_avg').show()
+                # read the morph data
+                e = nib.freesurfer.read_morph_data(msh_path)
 
-## Calculate average in an ROI defined using an atlas
-# load atlas and define a region
-# atlas = simnibs.get_atlas('HCP_MMP1')
-# region_name = 'lh.4'
-# roi = atlas[region_name]
-# # visualize region
-# results_fsavg.add_node_field(roi, region_name)
-# results_fsavg.view(visible_fields=region_name).show()
-#
-# # calculate mean field using a weighted mean
-# node_areas = results_fsavg.nodes_areas()
-# avg_field_roi = np.average(avg_field[roi], weights=node_areas[roi])
-# print(f'Average {field_name} in {region_name}: ', avg_field_roi)
-# results_fsavg.add_node_field(roi, region_name)
+                # Append efield values to dict
+                sess_key = 'offline' if target.name == 'AG' and sess == 'offline' else 'online'
+                fields[sess_key][target.name].append(e)
+
+
+    # group_fields = pd.DataFrame(fields, columns=["sub", "sess", "site", "Emagn"])
+    # group_fields.to_csv(os.path.join(base_dir, "group_fields.txt"), index = False, sep = "\t")
+
+    ## Calculate and plot averages
+    for session in fields:
+        for target in fields[session]:
+            mesh_fields = np.vstack(fields[session][target])
+            print(f"{session} - {target}: Found {mesh_fields.shape[0]} fields.")
+            avg_field = np.mean(mesh_fields, axis=0)
+            std_field = np.std(mesh_fields, axis=0)
+
+            # here we put the data for each .vtk file into one dict:
+            point_data = {'e_avg': avg_field, 'e_std': std_field}
+
+            output_fn = f"{output_folder}/{session}_{target}_{hem}_{surf}_{depth}.vtk"
+            print(f"Writing {output_fn}")
+            meshio.Mesh(np.squeeze(coords), [('triangle', faces)], point_data=point_data).write(output_fn)
