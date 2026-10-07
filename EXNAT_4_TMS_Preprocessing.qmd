@@ -5,7 +5,7 @@ date: "`r Sys.Date()`"
 format:
   html:
     toc: true
-    code-fold: true
+    code-fold: false
 editor_options:
   chunk_output_type: console
 ---
@@ -18,11 +18,12 @@ n.cores <- max(1, parallel::detectCores() %/% 2, na.rm = T) # Use half of the av
 ```
 
 # Load packages
-```{r packages, echo = FALSE, message = FALSE, warning = TRUE}
+```{r packages, message=FALSE, warning=FALSE}
 # Create a list with needed libraries
 pkgs <- c("here", # for working with relative paths
           "ggplot2", # for plots
-          "patchwork", # also for plots
+          "see", # also for plots
+          "egg", # for plots
           "dplyr", # for replacing multiple values in vector with different values
           "tidyverse", # for aggregating
           "psycho", # for computing d-prime values
@@ -46,8 +47,8 @@ today <- Sys.Date()
 today <- format(today, format="%y%m%d")
 ```
 
-# Load d-prime function from different R script:
-```{r source d-prime function, echo = FALSE}
+# Load d-prime function from different R script
+```{r source d-prime function}
 source(here::here("get_dprime.R")) # get script
 
 # creating a function for std.error
@@ -62,6 +63,7 @@ path_data_folder <- here::here("Raw_data/")
 # Read in data
 In this chunk, we read in every dataset individually, compute reading times, reading speed, d-primes, comprehension question performance, and so on, add a few information on the words we used (e.g. surprisal scores on our 4 time scales, word frequencies, word lengths, punctuation,...), 
 ```{r Read in data, message=FALSE}
+#| output: false
 # Get list of all .csv files in the data folder
 file_list <- list.files(path = path_data_folder, pattern = "^sub-.*\\.csv$")
 
@@ -482,7 +484,7 @@ saveRDS(df_comprehension_Qs, file = here::here("RData/df_comprehension_questions
 ```
 
 # Add info on stimulation type and session
-```{r add demographic info}
+```{r add demographic info, warning=FALSE, message=FALSE}
 df_participants_info <- read.table(here::here("EXNAT_4_TMS_participants.txt"), header = TRUE, sep = "\t")
 df_all_data_raw$participant <- str_pad(df_all_data_raw$participant, 2, pad = "0")
 df_participants_info$ID <- gsub("sub-","", df_participants_info$ID)
@@ -601,7 +603,7 @@ df_subset <- df_subset %>% pivot_longer(4:5, names_to = "target", values_to = "m
                                      plot_max_trains_trigger,
                                      nrow = 1))
 
-ggsave(plot_online_TMS_trains, file = here::here("Plots/plot_online_TMS_trains.png"), width = 180, height = 100, units = "mm")
+ggsave(plot_online_TMS_trains, file = here::here("Plots/plot_online_TMS_trains.png"), width = 180, height = 100, units = "mm", create.dir = TRUE)
 
 m_TMS_trains <- lmerTest::lmer(max_trains ~
                                     stim_type +
@@ -613,7 +615,7 @@ summary(m_TMS_trains)
 ```
 
 # Neuropsychological tests
-```{r}
+```{r Npsy, warning=FALSE, message=FALSE}
 # Check for possible sum score for neuropsychological tests and add to large df
 NP_df <- df_participants_info %>% 
   select(participant, TMT_A, TMT_B, DSST, RS)
@@ -670,8 +672,8 @@ df_all_data_raw <- full_join(df_all_data_raw, pc_scores)
 ```
 
 # Questionnaire Side effects
-```{r add side effects quest}
-df_sideEffects <- read.table(here::here("Quest_Side_Effects_cleaned.csv"), header = TRUE, sep = ";")
+```{r add side effects quest, warning=FALSE, message=FALSE}
+df_sideEffects <- read.table(here::here("Raw_data/Quest_Side_Effects_cleaned.csv"), header = TRUE, sep = ";")
 df_sideEffects$participant <- str_pad(df_sideEffects$participant, 2, pad = "0")
 df_sideEffects <- df_sideEffects %>% 
   select(-c(date, Kommentare.))
@@ -687,7 +689,7 @@ df_all_data_raw <- full_join(df_all_data_raw, df_sideEffects_summary)
 ```
 
 # Demographic information
-```{r demographic data}
+```{r demographic data, warning=FALSE, message=FALSE}
 path_data_folder <- here::here("Raw_data/Training/")
 
 # Get list of all .csv files in the data folder
@@ -774,8 +776,8 @@ df_demographics_raw$participant <- str_pad(df_demographics_raw$participant, 2, p
 df_all_data_raw <- full_join(df_all_data_raw, df_demographics_raw)
 ```
 
+```{r PCD, include=FALSE, echo=FALSE, eval=FALSE}
 # Add PCD (pulse-wise coil displacement)
-```{r PCD}
 # read pre-computed PCD values
 df_PCD = read.csv(here::here("PCD/pcd_combined.csv"))
 
@@ -889,13 +891,13 @@ df_all_data_raw <- df_all_data_raw %>%
 ```
 
 # Save raw df
-```{r}
+```{r save df, eval=FALSE}
 # Finally, save df ----
 saveRDS(df_all_data_raw, here::here("RData/df_all_data_raw.rds"))
 ```
 
+```{r create df with PCD values, message=FALSE, eval=FALSE, include=FALSE, echo=FALSE}
 # Create df with PCD values and trigger times
-```{r Read in data, message=FALSE}
 path_data_folder <- here::here("Raw_data/")
 
 # Get list of all .csv files in the data folder
@@ -985,7 +987,7 @@ write.csv(df_trigger_times, file = here::here("PCD/df_trigger_times.csv"), row.n
 ```
 
 # Outlier cleaning
-```{r Read in data, message=FALSE}
+```{r outlier cleaning, message=FALSE, warning=FALSE}
 # Identify outliers in reaction times
 df_all_data_clean <- df_all_data_raw
 
@@ -1193,7 +1195,7 @@ df_all_data_clean <- full_join(df_all_data_clean, df_efields_ext)
 ```
 
 # Save cleaned df
-```{r save clean df}
+```{r save clean df, eval=FALSE, include=FALSE, echo=FALSE}
 # exclude session 2 for participant 07, stim_type offline, since there was an error in this session with the experiment
 df_all_data_clean <- df_all_data_clean %>% 
   filter(!(participant == "07" & session == 2))
