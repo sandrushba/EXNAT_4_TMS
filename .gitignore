@@ -8,3 +8,5 @@ Efield_simulations/ROI_*
 Efield_simulations/*.xlsx
 .xlsx
 Efield_simulations/ebrains*
+Efield_simulations/fsavg_geometry
+EXNAT_4_TMS_MMs.qmd
