@@ -59,7 +59,7 @@ std.error <- function(x, na.rm = TRUE){sd(x, na.rm = TRUE)/sqrt(length(x[!is.na(
 path_data_folder <- here::here("Raw_data/")
 ```
 
-# Read in data & do preprocessing on participant-level
+# Read in data
 In this chunk, we read in every dataset individually, compute reading times, reading speed, d-primes, comprehension question performance, and so on, add a few information on the words we used (e.g. surprisal scores on our 4 time scales, word frequencies, word lengths, punctuation,...), 
 ```{r Read in data, message=FALSE}
 # Get list of all .csv files in the data folder
@@ -293,20 +293,10 @@ for (i in 1:length(file_list)) {
   # Load surprisal scores
   surprisal_df = read.csv(here::here("surprisal_scores/vanilla_2words_surprisal_entropy_48Texts_11_2025.csv"), sep = ",", header = TRUE)
 
-  # Explanation: I computed the scores in Python using a German GPT-2 model. For each text you can select a context chunk of x words (e.g. 5 words)
-  #              and predict the next word. For each possible continuation of your context, you get probabilities.
-  #              If you get the probability for the actual word and compute the negative log of it, you have the surprisal score
-  #              for your word on time scale x (e.g. 5 words = TS 5). The time scales are all highly correlated, which might be due to the fact that each
-  #              time scale also includes context information from all lower timescales, so it's like a Russian doll situation.
-  #              To deal with this problem, we masked all words that were already processed in lower time scales,
-  #              so each time scale only uses the "new" parts of the input chunk.
-
-
   # loop individual texts
   for (curr_text_nr in unique(subj_df$text_nr)){
 
     # in some blocks we don't have texts, so skip those
-    # CAVE: currently also skipping text 10 because I still need to calculate values for this text
     if (curr_text_nr == ""){
       next
       # if it's a text block, though, assign word frequencies from csv
@@ -527,9 +517,13 @@ df_all_data_raw <- df_all_data_raw[,c(1,42,43,2,74,46:50,3:41,44,45,51:73,75)]
 df_all_data_raw_subset <- subset(df_all_data_raw, stim_type != "offline")
 
 df_all_data_raw_subset$block_name <- factor(df_all_data_raw_subset$block_name, levels = c("Reading_Baseline_main_click", "2back_dual_main_click", "1back_single_main_click", "2back_single_main_click"))
+df_all_data_raw_subset <- df_all_data_raw_subset %>% 
+  mutate(stim_type = dplyr::recode_values(stim_type, 
+                                   "offline_online" ~ "Offline+Online", 
+                                   "sham" ~ "Sham"))
 
-df_subset <- df_all_data_raw %>%
-  group_by(participant, stim_type, block_name, target) %>% 
+df_subset <- df_all_data_raw_subset %>%
+  group_by(participant, stim_type, block_name) %>% 
   summarize(max_trains = max(total_triggers_sent_this_condition))
 
 label_map <- c(
@@ -543,11 +537,12 @@ df_subset$block_name_short <- label_map[df_subset$block_name]
 
 (plot_max_trains <- ggplot(df_subset, aes(x = block_name_short, y = max_trains)) +
     #geom_violinhalf(position = position_nudge(x = 0.05), width = 1.2) +
-    geom_boxplot(width = 0.4) +
-    stat_summary(fun = mean, geom = "text", aes(label = sprintf("M=%.1f", after_stat(y))), hjust = 1.4, size = 2.5, color = "blue", fontface = "bold") +
+    geom_violinhalf(position = position_dodge(width = 0.9), width = 1, color = NA, alpha = 0.5, fill = "#2D3B43") +
+    stat_summary(fun = mean, geom = "text", aes(label = sprintf("M=%.1f", after_stat(y))), hjust = 0.5, size = 2.5, color = "blue", fontface = "bold") +
     stat_summary(fun = min, geom = "text", aes(label = sprintf("min=%.0f", after_stat(y))), vjust = 1.5, size = 2, color = "grey30") +
     stat_summary(fun = max, geom = "text", aes(label = sprintf("max=%.0f", after_stat(y))), vjust = -0.5, size = 2, color = "grey30") +
     scale_x_discrete(expand = expansion(add = c(0.8, 0.5))) +  
+    ylab("Number of online TMS trains") +
     facet_grid(~stim_type) +
     theme_bw() +
     theme(#legend.position = "none",
@@ -563,15 +558,33 @@ df_subset$block_name_short <- label_map[df_subset$block_name]
          axis.text.x.bottom = element_text(size = 8))
 )
 
-(plot_max_trains_trigger <- ggplot(df_subset[df_subset$block_name != "Reading_Baseline_main_click",], aes(x = block_name_short, y = max_trains, color = target, fill = target)) +
+df_subset <- df_all_data_raw_subset %>%
+  group_by(participant, stim_type, block_name) %>% 
+  summarize(True = max(target_triggers_sent_this_condition),
+            False = max(total_triggers_sent_this_condition) - max(target_triggers_sent_this_condition))
+
+label_map <- c(
+  "Reading_Baseline_main_click" = "Reading",
+  "2back_dual_main_click" = "Dual task",
+  "1back_single_main_click" = "1-back",
+  "2back_single_main_click" = "2-back"
+)
+
+df_subset$block_name_short <- label_map[df_subset$block_name]
+
+df_subset <- df_subset %>% pivot_longer(4:5, names_to = "target", values_to = "max_trains")
+
+(plot_max_trains_trigger <- ggplot(df_subset[df_subset$block_name != "Reading_Baseline_main_click",], aes(x = block_name_short, y = max_trains)) +
     #geom_violinhalf(position = position_dodge(width = 0.6), width = 1.2) +
-    geom_boxplot(position = position_dodge(width = 0.9), width = 0.4, fill = NA) +
-    stat_summary(fun = mean, geom = "text", aes(label = sprintf("M=%.1f", after_stat(y))), vjust = -0.5, size = 2.5, color = "blue", fontface = "bold", position = position_dodge(width = 0.9),) +
+    geom_violinhalf(position = position_dodge(width = 0.9), width = 1, color = NA, alpha = 0.5, fill = "#2D3B43") +
+    stat_summary(fun = mean, geom = "text", aes(label = sprintf("M=%.1f", after_stat(y))), vjust = 0, size = 2.5, color = "blue", fontface = "bold", position = position_dodge(width = 0.9),) +
     stat_summary(fun = min, geom = "text", aes(label = sprintf("min=%.0f", after_stat(y))), vjust = 1.5, size = 2, color = "grey30", position = position_dodge(width = 0.9),) +
     stat_summary(fun = max, geom = "text", aes(label = sprintf("max=%.0f", after_stat(y))), vjust = -0.5, size = 2, color = "grey30", position = position_dodge(width = 0.9),) +
-    facet_grid(~stim_type) +
+    scale_y_continuous(expand = expansion(add = c(20, 20))) +  
+    facet_grid(target ~ stim_type) +
+    ylab("Number of online TMS trains") +
     theme_bw() +
-    theme(legend.position = "bottom",
+    theme(legend.position = "none",
          text = element_text(family = "Helvetica"),
          panel.grid.major.x = element_blank(),
          panel.grid.minor = element_blank(),
@@ -584,8 +597,11 @@ df_subset$block_name_short <- label_map[df_subset$block_name]
          axis.text.x.bottom = element_text(size = 8))
 )
 
-(plot_online_TMS_trains <- plot_max_trains / plot_max_trains_trigger)
-ggsave(plot_online_TMS_trains, file = here::here("Plots/plot_online_TMS_trains.png"), width = 155, height = 200, units = "mm")
+(plot_online_TMS_trains <- ggarrange(plot_max_trains,
+                                     plot_max_trains_trigger,
+                                     nrow = 1))
+
+ggsave(plot_online_TMS_trains, file = here::here("Plots/plot_online_TMS_trains.png"), width = 180, height = 100, units = "mm")
 
 m_TMS_trains <- lmerTest::lmer(max_trains ~
                                     stim_type +
@@ -629,11 +645,28 @@ psych::alpha(NP_df[,c(4,5,7,8)])
 scores_z <- scale(NP_df[, c("DSST", "TMT_A_inv", "TMT_B_inv")])
 NP_df$executive_sum <- rowMeans(scores_z, na.rm = TRUE)
 
-NP_df <- NP_df %>% 
-  select(participant, executive_sum)
+# PCA for Npsy scores ----
+pca_fit <- prcomp(
+  NP_df %>% 
+    select(-c(participant, TMT_A, TMT_B, mean_dprime_singletasks, executive_sum)),
+  center = TRUE,
+  scale. = TRUE
+)
+
+summary(pca_fit)
+pca_fit$rotation   # loadings
+pca_fit$x          # participant scores on each PC
+
+pc_scores <- NP_df %>%
+  select(participant) %>%
+  bind_cols(as.data.frame(pca_fit$x)) %>% 
+  select(participant, PC1)
 
 # Merge with large df
+NP_df <- NP_df %>% 
+  select(participant, executive_sum)
 df_all_data_raw <- full_join(df_all_data_raw, NP_df)
+df_all_data_raw <- full_join(df_all_data_raw, pc_scores)
 ```
 
 # Questionnaire Side effects
@@ -739,13 +772,221 @@ df_demographics_raw$participant <- str_pad(df_demographics_raw$participant, 2, p
 
 # join with large df
 df_all_data_raw <- full_join(df_all_data_raw, df_demographics_raw)
+```
 
+# Add PCD (pulse-wise coil displacement)
+```{r PCD}
+# read pre-computed PCD values
+df_PCD = read.csv(here::here("PCD/pcd_combined.csv"))
+
+# some participants have more tracked pulses than 1500 (max for AG offline rTMS: 1500 pulses), let's limit this
+df_PCD <- df_PCD %>%
+  filter(!(target == "AG" & idx > 1500)) %>% 
+  rename(stim_type = session,
+         participant = sub,
+         trigger_idx = idx,
+         PCD_target = target)
+df_PCD$participant <- gsub("sub-", "", df_PCD$participant)
+
+# add idx for trigger to large df
+df_all_data_raw <- df_all_data_raw %>% 
+  group_by(participant, stim_type) %>% 
+  mutate(trigger_present = ifelse(!is.na(trigger_time), 1, 0),
+         trigger_idx = cumsum(trigger_present)) %>% 
+  select(-trigger_present)
+
+z <- df_all_data_raw %>% 
+  group_by(participant, stim_type) %>% 
+  summarise(min_trigger = min(trigger_idx), max_trigger = max(trigger_idx)) %>% 
+  filter(stim_type != "sham")
+y <- df_PCD %>% 
+  group_by(participant, stim_type, PCD_target) %>% 
+  summarise(min_trigger_PCD = min(trigger_idx), max_trigger_PCD = max(trigger_idx))
+test <- full_join(z,y)
+ggplot(test[test$PCD_target == "DLPFC",], aes(x = max_trigger, y = max_trigger_PCD, colour = participant)) + 
+  geom_point() +
+  facet_wrap(~ PCD_target) +
+  geom_text(mapping = aes(label = participant, x = max_trigger +.5))
+
+# exclude unrealistic PCD values (PCD > 20)
+df_PCD <- df_PCD %>% 
+  filter(abs(PCD) < 20)
+
+# calc mean for AG session
+df_PCD <- df_PCD %>% 
+  group_by(participant, stim_type) %>% 
+  #mutate(PCD_q99 = quantile(PCD, probs = 0.99)) %>% 
+  #filter(abs(PCD) <= PCD_q99) %>% 
+  mutate(
+    PCD = case_when(
+      PCD_target == "AG" ~ mean(PCD),
+      PCD_target == "DLPFC" ~ PCD
+    )
+  ) %>% 
+  select(-trigger_idx, -interpolated) %>% 
+  distinct() %>% 
+  group_by(participant, stim_type, PCD_target) %>% 
+  mutate(trigger_idx = row_number())
+
+# for now, exclude PCD for AG (offline) in offline_online session
+df_PCD <- df_PCD %>% 
+  filter(!(stim_type == "offline_online" & PCD_target == "AG"))
+
+# combine both dfs
+df_all_data_raw <- full_join(df_all_data_raw, df_PCD)
+
+# fix up NA values
+df_all_data_raw <- df_all_data_raw %>% 
+  group_by(participant) %>% 
+  mutate(
+    PCD_target = case_when(
+      stim_type == "sham" ~ "sham",
+      stim_type == "offline_online" ~ "DLPFC",
+      stim_type == "offline" ~ "AG",
+      TRUE ~ PCD_target),
+    PCD_AG = first(PCD[PCD_target == "AG" & !is.na(PCD)]),
+    PCD = case_when(
+      # keep all existing non-NA values
+      !is.na(PCD) ~ PCD,
+      
+      # special case  sub17: for DLPFC trials, use their AG PCD (we dont have PCD for online trials)
+      participant == "17" & PCD_target == "DLPFC" ~ PCD_AG,
+      
+      # offline: replace NA with that participant's AG PCD
+      stim_type == "offline" ~ PCD_AG,
+      
+      # offline_online: replace NA with median PCD of offline_online rows
+      stim_type == "offline_online" ~ median(PCD[stim_type == "offline_online"], na.rm = TRUE),
+      
+      stim_type == "sham" ~ 0,
+      
+      # sham or anything else: leave as is (NA)
+      TRUE ~ PCD
+    )) %>% 
+  select(-PCD_AG)
+
+# show number of trials that will be excluded with quantile > 99
+df_all_data_raw %>%
+  ungroup() %>% 
+  mutate(PCD_q99 = quantile(PCD, 0.99, na.rm = TRUE)) %>%
+  summarise(
+    n_trials = n(),
+    n_excluded = sum(abs(PCD) > PCD_q99, na.rm = TRUE),
+    pct_excluded = 100 * n_excluded / n_trials
+  ) %>%
+  print()
+
+# exclude rows based on 99 quantile PCD
+df_all_data_raw <- df_all_data_raw %>% 
+  group_by(participant, stim_type, PCD_target) %>% 
+  mutate(PCD_q99 = quantile(PCD, probs = 0.99)) %>% 
+  filter(abs(PCD) <= PCD_q99) %>% 
+  select(-PCD_q99) %>% 
+  distinct() %>% 
+  group_by(participant, stim_type, target) %>% 
+  mutate(idx = row_number()) %>% 
+  ungroup()
+```
+
+# Save raw df
+```{r}
 # Finally, save df ----
 saveRDS(df_all_data_raw, here::here("RData/df_all_data_raw.rds"))
 ```
 
+# Create df with PCD values and trigger times
+```{r Read in data, message=FALSE}
+path_data_folder <- here::here("Raw_data/")
+
+# Get list of all .csv files in the data folder
+file_list <- list.files(path = path_data_folder, pattern = "^sub-.*\\.csv$")
+
+# Placeholders df for demographics, questions & text data
+df_trigger_times <- data.frame()
+
+# Loop files in my file list aka directory
+for (i in 1:length(file_list)) {
+
+  # PREPARE FILE FOR PREPROCESSING
+  # Read in current file
+  subj_df <- read.csv(paste(path_data_folder, file_list[i],sep = ""), sep = ",")
+
+  # If the df is separated by a semicolon instead of a comma, we only get
+  # one messed-up column. In this case, use semicolon as separator for csv:
+  if (ncol(subj_df) == 1) {
+   subj_df <- read.csv(paste(path_data_folder, file_list[i],sep = ""), sep = ";")
+  }
+  
+  id <- subj_df$participant[1]
+  
+  # print message
+  message(paste(i, " - Reading in file ", file_list[i], ", participant ID: ", id, sep = ""))
+
+  # Get relevant columns
+  subj_df <- subj_df[, c("participant", "session", "total_triggers_sent_this_condition", "trigger_time", "trial_nr")]
+
+  # remove weird empty rows in df, most likely written by Psychopy
+  subj_df <- subset(subj_df, !is.na(trial_nr))
+  
+  # add trigger_idx
+  subj_df <- subj_df %>% 
+    group_by(session) %>% 
+    mutate(trigger_present = ifelse(!is.na(trigger_time), 1, 0),
+         trigger_idx = cumsum(trigger_present)) %>% 
+    select(-trigger_present)
+  
+  # also remove case of trigger_idx = 0
+  subj_df <- subset(subj_df, trigger_idx > 0)
+  
+  # add updated trigger time column (time of first trigger ~ 0)
+  subj_df <- subj_df %>% 
+    group_by(session) %>% 
+    mutate(time_rel2firstTrigger = case_when(
+      !is.na(trigger_time) ~ trigger_time - first(trigger_time),
+      TRUE ~ NA)) %>% 
+    select(-c(total_triggers_sent_this_condition, trial_nr)) %>% 
+    filter(!is.na(trigger_time)) %>% 
+    distinct()
+  
+  subj_df <- subj_df[,c("participant", "session", "trigger_idx", "trigger_time", "time_rel2firstTrigger")]
+  
+  subj_df$participant <- as.character(subj_df$participant)
+  subj_df$participant <- str_pad(subj_df$participant, width = 2, pad = "0")
+  
+  df_trigger_times <- as.data.frame(rbind(df_trigger_times, subj_df))
+}
+
+# Add info on stimulation type per session ----
+df_participants_info <- read.table(here::here("EXNAT_4_TMS_participants.txt"), header = TRUE, sep = "\t")
+df_all_data_raw$participant <- str_pad(df_all_data_raw$participant, 2, pad = "0")
+df_participants_info$ID <- gsub("sub-","", df_participants_info$ID)
+df_participants_info <- df_participants_info %>% 
+  rename(participant = ID)
+
+df_trigger_times <- full_join(df_trigger_times, df_participants_info)
+
+# create a new column with stim type
+df_trigger_times <- df_trigger_times %>% 
+  mutate(stim_type = case_when(session == 1 & (Stim_Order == "offline,offline_online,sham" | Stim_Order == "offline,sham,offline_online") ~ "offline",
+                               session == 1 & (Stim_Order == "sham,offline_online,offline" | Stim_Order == "sham,offline,offline_online") ~ "sham",
+                               session == 1 & (Stim_Order == "offline_online,sham,offline" | Stim_Order == "offline_online,offline,sham") ~ "offline_online",
+                               session == 2 & (Stim_Order == "offline,offline_online,sham" | Stim_Order == "sham,offline_online,offline") ~ "offline_online",
+                               session == 2 & (Stim_Order == "offline_online,offline,sham" | Stim_Order == "sham,offline,offline_online") ~ "offline",
+                               session == 2 & (Stim_Order == "offline_online,sham,offline" | Stim_Order == "offline,sham,offline_online") ~ "sham",
+                               session == 3 & (Stim_Order == "offline,offline_online,sham" | Stim_Order == "offline_online,offline,sham") ~ "sham",
+                               session == 3 & (Stim_Order == "sham,offline_online,offline" | Stim_Order == "offline_online,sham,offline") ~ "offline",
+                               session == 3 & (Stim_Order == "offline,sham,offline_online" | Stim_Order == "sham,offline,offline_online") ~ "offline_online",
+                             TRUE ~ NA))
+
+df_trigger_times <- df_trigger_times %>% 
+  select(participant, session, stim_type, trigger_idx, trigger_time, time_rel2firstTrigger)
+
+write.csv(df_trigger_times, file = here::here("PCD/df_trigger_times.csv"), row.names = FALSE)
+```
+
+# Outlier cleaning
+```{r Read in data, message=FALSE}
 # Identify outliers in reaction times
-```{r}
 df_all_data_clean <- df_all_data_raw
 
 ### TRANSFORM RT DATA ####
@@ -893,10 +1134,11 @@ df_subset <- df_all_data_clean %>%
 (plot_session_length <- ggplot(df_subset, aes(x = stim_type, y = session_length_s)) +
     #geom_violinhalf(position = position_nudge(x = 0.05), width = 1.2) +
     geom_boxplot(width = 0.4) +
-    stat_summary(fun = mean, geom = "text", aes(label = sprintf("M=%.1f", after_stat(y))), vjust = -1.5, size = 2.5, color = "blue", fontface = "bold") +
-    stat_summary(fun = min, geom = "text", aes(label = sprintf("min=%.0f", after_stat(y))), vjust = 1.5, size = 2, color = "grey30") +
-    stat_summary(fun = max, geom = "text", aes(label = sprintf("max=%.0f", after_stat(y))), vjust = -0.5, size = 2, color = "grey30") +
+    stat_summary(fun = mean, geom = "text", aes(label = sprintf("M=%.1f", after_stat(y))), vjust = -1.5, size = 2, color = "blue", fontface = "bold") +
+    stat_summary(fun = min, geom = "text", aes(label = sprintf("min=%.0f", after_stat(y))), vjust = 1.5, size = 1.5, color = "grey30") +
+    stat_summary(fun = max, geom = "text", aes(label = sprintf("max=%.0f", after_stat(y))), vjust = -0.5, size = 1.5, color = "grey30") +
     scale_x_discrete(expand = expansion(add = c(0.8, 0.5))) +  
+    ylab("Session length in s") +
     #facet_grid(~stim_type) +
     theme_bw() +
     theme(#legend.position = "none",
@@ -911,7 +1153,7 @@ df_subset <- df_all_data_clean %>%
          axis.text.x = element_text(angle = 45, hjust = 1),
          axis.text.x.bottom = element_text(size = 8))
 )
-ggsave(plot_session_length, file = here::here("Plots/plot_session_length.png"), width = 100, height = 100, units = "mm")
+ggsave(plot_session_length, file = here::here("Plots/plot_session_length.png"), width = 50, height = 70, units = "mm")
 
 m_sessionLength <- lmerTest::lmer(session_length_s ~
                                     stim_type +
@@ -948,111 +1190,6 @@ df_all_data_clean <- df_all_data_no_outliers
 df_efields_ext <- readRDS(here::here("RData/df_efields_ext.rds"))
 
 df_all_data_clean <- full_join(df_all_data_clean, df_efields_ext)
-```
-
-# Add PCD (pulse-wise coil displacement)
-```{r PCD}
-# read pre-computed PCD values
-df_PCD = read.csv(here::here("PCD/pcd_combined.csv"))
-
-# some participants have more tracked pulses than 1500 (max for AG offline rTMS: 1500 pulses), let's limit this
-df_PCD <- df_PCD %>%
-  filter(!(target == "AG" & idx > 1500)) %>% 
-  rename(stim_type = session,
-         participant = sub,
-         trigger_idx = idx,
-         PCD_target = target)
-df_PCD$participant <- gsub("sub-", "", df_PCD$participant)
-
-# exclude unrealistic PCD values (PCD > 20)
-df_PCD <- df_PCD %>% 
-  filter(abs(PCD) < 20)
-
-# calc mean for AG session
-df_PCD <- df_PCD %>% 
-  group_by(participant, stim_type) %>% 
-  #mutate(PCD_q99 = quantile(PCD, probs = 0.99)) %>% 
-  #filter(abs(PCD) <= PCD_q99) %>% 
-  mutate(
-    PCD = case_when(
-      PCD_target == "AG" ~ mean(PCD),
-      PCD_target == "DLPFC" ~ PCD
-    )
-  ) %>% 
-  select(-trigger_idx, -interpolated) %>% 
-  distinct() %>% 
-  group_by(participant, stim_type, PCD_target) %>% 
-  mutate(trigger_idx = row_number())
-
-# for now, exclude PCD for AG (offline) in offline_online session
-df_PCD <- df_PCD %>% 
-  filter(!(stim_type == "offline_online" & PCD_target == "AG"))
-
-# add idx for trigger to large df
-test <- df_all_data_raw %>% 
-  group_by(participant, stim_type) %>% 
-  mutate(trigger_present = ifelse(!is.na(trigger_time), 1, 0),
-         trigger_idx = cumsum(trigger_present)) %>% 
-  select(-trigger_present)
-
-# combine both dfs
-test_all <- full_join(df_PCD, test)
-
-# fix up NA values
-test_all <- test_all %>% 
-  group_by(participant) %>% 
-  mutate(
-    PCD_target = case_when(
-      stim_type == "sham" ~ "sham",
-      stim_type == "offline_online" ~ "DLPFC",
-      stim_type == "offline" ~ "AG",
-      TRUE ~ PCD_target),
-    PCD_AG = first(PCD[PCD_target == "AG" & !is.na(PCD)]),
-    PCD = case_when(
-      # keep all existing non-NA values
-      !is.na(PCD) ~ PCD,
-      
-      # offline: replace NA with that participant's AG PCD
-      stim_type == "offline" ~ PCD_AG,
-      
-      # offline_online: replace NA with median PCD of offline_online rows
-      stim_type == "offline_online" ~ median(PCD[stim_type == "offline_online"], na.rm = TRUE),
-      
-      stim_type == "sham" ~ 0,
-      
-      # sham or anything else: leave as is (NA)
-      TRUE ~ PCD
-    )) %>% 
-  select(-PCD_AG)
-
-# sub 17 doesn't have PCD values for offline_online session!
-  
-
-# exclude rows based on 99 quantile PCD?
-
-
-
-df_PCD <- df_PCD %>% 
-  group_by(participant, stim_type) %>% 
-  mutate(PCD_q99 = quantile(PCD, probs = 0.99)) %>% 
-  filter(abs(PCD) <= PCD_q99) %>% 
-  mutate(
-    PCD = case_when(
-      target == "AG"    ~ mean(PCD),
-      target == "DLPFC" ~ PCD
-    )
-  ) %>% 
-  select(-idx, -interpolated, -PCD_q99) %>% 
-  distinct() %>% 
-  group_by(participant, stim_type, target) %>% 
-  mutate(idx = row_number())
-
-# how many pulse indices do we have in the other df?
-test2 <- t %>% 
-  group_by(participant, stim_type) %>% 
-  #filter(!is.na(trigger_time)) %>% 
-  select(maximum_triggers_this_block, minimum_triggers_this_condition, total_triggers_sent_this_condition, trigger_time, trigger_present, trigger_idx)
-
 ```
 
 # Save cleaned df

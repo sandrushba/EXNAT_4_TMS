@@ -1,0 +1,3639 @@
+---
+title: "EXNAT_4_TMS_Stats_Reading"
+author: "Sandra Martin"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    code-fold: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r file setup, echo = FALSE}
+rm(list = ls()) # clear environment
+knitr::opts_chunk$set() # set default options for all code blocks in this document
+options(scipen = 999) # don't use scientific notation for very large or small numbers
+n.cores <- max(1, parallel::detectCores() %/% 2, na.rm = T) # Use half of the available cores
+```
+
+# Load packages
+```{r packages, echo = FALSE, message = FALSE, warning = TRUE}
+# Create a list with needed libraries
+pkgs <- c("here", # for working with relative paths
+          "ggeffects",
+          "marginaleffects",
+          "emmeans",
+          "ggplot2", # for plots
+          "dplyr", # for replacing multiple values in vector with different values
+          "tidyverse", # for aggregating
+          "easystats", # includes performance, see, insight, modelbased
+          #"lme4", # also for linear mixed emodels, but no p-values in the summary
+          "lmerTest", # extension of lme4 - for tab_model() for showing lme4 model results
+          "glmmTMB",
+          "mgcv",
+          "gratia",
+          "itsadug",
+          "ggside",
+          "ggpubr",
+          "car", # for basic Anova() function & aGSIFs (= basically weird adjusted VIFs)
+          "sjPlot", # for running Anova & showing results in a HTML table in the Viewer
+          "ggnewscale",
+          "colorspace", # for beautiful and balanced color palettes
+          "ggrepel", # for labels
+          "scales",
+          "egg") # creating patchwork plots
+
+# Load each listed library, check if it's already installed
+# and install if necessary
+for (pkg in pkgs){
+  if(!require(pkg, character.only = TRUE)){
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+}
+
+today <- Sys.Date()
+today <- format(today, format="%y%m%d")
+
+emm_options(rg.limit = 1000000) # for emm calculations
+```
+
+# Load R Data
+```{r}
+df_all_data_clean <- readRDS(here::here("RData/df_all_data_clean.rds")) # df with all trials and participants incl demographic information
+
+# load LMM (which takes really long to compute) but not gamm, which is computed quite fast
+lmm_reading <- readRDS(file = here("RData/models/lmm_reading.rds"))
+
+# reading predictions and comparisons (take quite long to calculate due to long dfs)
+pred_surprisal <- readRDS(file = here("RData/models/gamm_reading_pred_surprisal.rds"))
+cmp_reading_surprisal <- readRDS(file = here("RData/models/gamm_reading_comp_reading_surprisal.rds"))
+
+pred_time <- readRDS(file = here("RData/models/gamm_reading_pred_time.rds"))
+cmp_reading_time <- readRDS(file = here("RData/models/gamm_reading_comp_reading_time.rds"))
+cmp_reading_time_NoTask <- readRDS(file = here("RData/models/gamm_reading_comp_reading_time_NoTask.rds"))
+```
+
+# Settings for plots
+```{r Theme for plots, echo = FALSE}
+# Custom colour palettes for the plots:
+palet_task_condition <- c("#D2BFE7",
+                      "#977FB2") 
+palet_task_condition_lines <- c("#ad8bd3",
+                      "#7B5EC6") 
+
+# for distinguishing between cognitive load conditions: 
+ cols_reading <- c("#575A7B", # Reading Only
+                 "#ED9201", # 1-back
+                 "#982126") # 2-back
+#cols_reading <- c("#F8A29E", "#9F4D48", "#4B201D", "#D2BFF5", "#9b84b7", "#56476D")
+cols_reading <- c("#F8A29E", "#9F4D48", "#4B201D", "#E9B3FB", "#85409D", "#3B0270")
+#cols_dual <- c("#D2BFE7", "#9b84b7", "#56476D")
+
+cols_dualContrast <- c("#B29675", "#575A7B")
+
+# creating a function for std.error
+std.error <- function(x, na.rm = TRUE){sd(x, na.rm = TRUE)/sqrt(length(x[!is.na(x)]))}
+```
+
+# READING ANALYSIS: READING ONLY & DUAL TASK
+## Df for reading tasks
+```{r df for single n-back}
+reading_df <- subset(df_all_data_clean, task != "1back_single_main_click" & task != "2back_single_main_click")
+reading_df <- droplevels(reading_df)
+```
+
+## Prepare df, contrast coding
+```{r prepare data for stats single n-back, echo = FALSE}
+# add column with information whether there was a TMS burst in a certain trial or not
+reading_df <- reading_df %>% 
+  mutate(is_trigger = case_when(
+    stim_type != "Offline" & !is.na(trigger_time) ~ "True",
+    stim_type != "Offline" & is.na(trigger_time) ~ "False",
+    stim_type == "Offline" ~ "False"
+  ))
+
+# if the n-back trial was in the dual task (adding level to cognitive load column)
+reading_df <- reading_df %>% 
+  mutate(cognitive_load = case_when(
+    task == "2back_dual_main_click" ~ "dual task",
+    TRUE ~ "single task"
+  ))
+
+# simple coding ----
+# create a simple coding scheme for reaction (2 levels), is_trigger, cognitive_load
+c <- contr.treatment(2) 
+my.coding <- matrix(rep(1/2, 2), ncol = 1) 
+my.simple <- c-my.coding
+
+reading_df$reaction <- as.factor(reading_df$reaction)
+contrasts(reading_df$reaction) <- my.simple
+
+reading_df$is_trigger <- as.factor(reading_df$is_trigger)
+contrasts(reading_df$is_trigger) <- my.simple
+
+reading_df$cognitive_load <- as.factor(reading_df$cognitive_load)
+contrasts(reading_df$cognitive_load) <- my.simple
+
+reading_df$task <- factor(reading_df$task, levels = c("Reading_Baseline_main_click", "2back_dual_main_click"))
+contrasts(reading_df$task) <- my.simple
+
+# simple coding for stimulation type, session, block name, cognitive_load
+c <- contr.treatment(3) 
+my.coding <- matrix(rep(1/3, 6), ncol = 2) 
+my.simple <- c-my.coding
+
+reading_df$stim_type <- factor(reading_df$stim_type, levels = c("Sham", "Offline", "Offline + Online"))
+contrasts(reading_df$stim_type) <- my.simple
+
+reading_df$session <- as.factor(reading_df$session)
+contrasts(reading_df$session) <- my.simple
+
+# simple coding for punctuation (5 levels)
+c <- contr.treatment(5) 
+my.coding <- matrix(rep(1/5, 20), ncol = 4) 
+my.simple <- c-my.coding
+reading_df$punctuation <- as.factor(reading_df$punctuation)
+contrasts(reading_df$punctuation) <- my.simple
+
+# simple coding for stimulation order (6 levels)
+c <- contr.treatment(6) 
+my.coding <- matrix(rep(1/6, 30), ncol = 5) 
+my.simple <- c-my.coding
+reading_df$Stim_Order <- as.factor(reading_df$Stim_Order)
+contrasts(reading_df$Stim_Order) <- my.simple
+
+# create a column for time that sets first trial of each task to 0 and calculates time to next trial so we get a measure of time progress in s across one session
+reading_df <- reading_df %>%
+  arrange(participant, stim_type, trial_index_session) %>%
+  group_by(participant, stim_type, date, task) %>%
+  mutate(
+    time_from_onset_task = as.numeric(global_onset_time - first(global_onset_time), units = "secs"),
+    task_onset = first(time_from_onset_session),
+    block_nr_task = cumsum(trial_nr == 1)
+  ) %>%
+  ungroup()
+
+# add column whether the previous trial and second to last trials were an n-back target or not and whether the previous response was correct or incorrect
+reading_df <- reading_df %>%
+  group_by(participant, stim_type, block_nr_exp) %>%
+  mutate(
+    # Previous trial was target (lag 1)
+    prev_target = lag(target, n = 1, default = NA),
+    
+    # Second-to-last trial was target (lag 2)
+    prev2_target = lag(target, n = 2, default = NA),
+    
+    # Previous trial accuracy (for post-error effects)
+    prev_correct = lag(nback_response, n = 1, default = NA),
+    
+    # RT of previous trial
+    previous_duration = lag(RT, n = 1, default = NA)
+  ) %>%
+  ungroup()
+
+# Create column that codes nback acc as correct/incorrect instead of four levels (avoids collinearity with reaction predictor in model)
+reading_df <- reading_df %>% 
+  mutate(nback_acc = case_when(
+    nback_response == "correct rejection" ~ "correct",
+    nback_response == "hit" ~ "correct",
+    nback_response == "false alarm" ~ "incorrect",
+    nback_response == "miss" ~ "incorrect",
+  ))
+
+# simple coding previous reaction, previous target, previous2 target, nback_acc
+c <- contr.treatment(2) 
+my.coding <- matrix(rep(1/2, 2), ncol = 1) 
+my.simple <- c-my.coding
+
+reading_df$previous_reaction[reading_df$previous_reaction == ""] <- NA
+reading_df$previous_reaction <- as.factor(reading_df$previous_reaction)
+reading_df$previous_reaction <- droplevels(reading_df$previous_reaction)
+contrasts(reading_df$previous_reaction) <- my.simple
+
+reading_df$nback_acc <- as.factor(reading_df$nback_acc)
+contrasts(reading_df$nback_acc) <- my.simple
+
+c <- contr.treatment(3) 
+my.coding <- matrix(rep(1/3, 6), ncol = 2) 
+my.simple <- c-my.coding
+
+reading_df$prev_target <- as.factor(reading_df$prev_target)
+contrasts(reading_df$prev_target) <- my.simple
+
+reading_df$prev2_target <- as.factor(reading_df$prev2_target)
+contrasts(reading_df$prev2_target) <- my.simple
+
+reading_df$Age <- as.numeric(reading_df$Age)
+
+# Add the information how many triggers there were per block 
+# Ultimately doesn't perform well in models because there was no online trigger in the offline session leading to overall weird estimates
+# CAVE: this is centred within the offline+online & sham session and NOT the offline session since there were no triggers per block in this session
+# nback_df <- nback_df %>% 
+#   group_by(participant, stim_type, block_names_numbered) %>% 
+#   mutate(trigger_per_block = sum(is_trigger == "True")) %>% 
+#   ungroup()
+# nback_df <- nback_df %>%
+#   mutate(
+#     grand_mean_nonoffline = mean(trigger_per_block[stim_type != "Offline"], na.rm = TRUE),
+#     trigger_per_block_centered = case_when(
+#       stim_type == "Offline" ~ 0,
+#       TRUE ~ trigger_per_block - grand_mean_nonoffline
+#     )
+#   ) %>%
+#   select(-grand_mean_nonoffline, -trigger_per_block)  # Clean up temporary variable
+# nback_df$trigger_per_block_centered <- as.numeric(nback_df$trigger_per_block_centered)
+
+# save single n-back df ----
+# saveRDS(nback_df, file = here::here("RData/nback_df.rds"))
+
+# For statistical models, remove first trials w/o surprisal values on ts 2 ----
+reading_df <- subset(reading_df, !is.na(surprisal_2) & !is.na(previous_surprisal_2))
+reading_df <- subset(reading_df, surprisal_2 < 40)
+#reading_df <- subset(reading_df, RT > 100)
+reading_df <- reading_df %>% 
+  mutate(task = dplyr::recode(task, "Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "2-back dual"))
+```
+
+## ALL TRIALS: Reading time analysis
+```{r}
+# look at RT
+hist(log(reading_df$RT))
+hist(reading_df$RT)
+fitdistrplus::descdist(reading_df$RT)
+fitdistrplus::descdist(log(reading_df$RT))
+
+# GAMM ----
+reading_df <- reading_df %>% 
+  mutate(across(where(is.character), as.factor))
+
+gamm_reading <- bam(log(RT) ~ 
+            # parametric main effects and interactions (factors)  
+              #stim_type + 
+              #task +
+              session + 
+              is_trigger + 
+              reaction +
+              punctuation +
+              RS +
+              executive_sum +
+              education_years +
+              Age +
+              sideEffects_sum +
+              #stim_type:task + 
+            # non-parametric main effects (smooths)
+              s(time_from_onset_task, k = 20) + 
+              s(surprisal_2, k = 20) + 
+              s(entropy_2, k = 30) +
+              s(word_length_single, k = 20) + 
+              s(zipf_frequency, k = 20) +
+              s(log(previous_duration), k = 50) +
+              s(previous_surprisal_2, k = 20) + 
+            # interactions
+              s(stim_type, time_from_onset_task, bs = "sz", k = 20) + 
+              s(task, time_from_onset_task, bs = "sz", k = 20) + 
+              s(stim_type, task, time_from_onset_task, bs = "sz", k = 20) + 
+              #s(time_from_onset_task, by = stimType_task, k = 20) + # old way of writing the interaction term
+              
+              s(stim_type, surprisal_2, bs = "sz", k = 20) + 
+              s(task, surprisal_2, bs = "sz", k = 20) + 
+              s(stim_type, task, surprisal_2, bs = "sz", k = 20) + 
+              #s(surprisal_2, by = stimType_task, k = 20) + # old way of writing the interaction term
+            # random terms
+              s(participant, bs = "re") +
+              s(participant, stim_type, bs = "re") +
+              s(participant, task, bs = "re") +  
+              s(surprisal_2, participant, bs = "fs", k = 10) +
+              s(time_from_onset_task, participant, bs = "fs") +
+              s(text_nr, bs = "re"),
+    data = reading_df,
+    #family = Gamma(link = "log"),
+    method = "fREML",
+    discrete = TRUE,
+    control = gam.control(nthreads = n.cores)
+)
+
+gam.check(gamm_reading, k.rep = 1000)
+
+summary(gamm_reading)
+
+# LMM ----
+lmm_reading <- lmerTest::lmer(log(RT) ~
+                         stim_type +
+                         session +
+                         task +
+                         is_trigger +
+                         reaction + 
+                         punctuation +
+                         scale(time_from_onset_task, scale = FALSE) +   
+                         scale(RS, scale = FALSE) +
+                         scale(executive_sum, scale = FALSE) +
+                         scale(education_years, scale = FALSE) +
+                         scale(Age, scale = FALSE) +
+                         scale(sideEffects_sum, scale = FALSE) +
+                         # lexical predictors
+                         scale(surprisal_2, scale = FALSE) + # slope yes
+                         scale(entropy_2, scale = FALSE) + # slope no
+                         scale(zipf_frequency, scale = FALSE) + # slope no
+                         scale(word_length_single, scale = FALSE) + # slope no
+                         scale(log(previous_duration), scale = FALSE) +
+                         scale(previous_surprisal_2, scale = FALSE) + # slope no
+                         # interactions
+                         stim_type:task +
+                         stim_type:scale(time_from_onset_task, scale = FALSE) +   
+                         stim_type:scale(surprisal_2, scale = FALSE) +   
+                         task:scale(surprisal_2, scale = FALSE) +   
+                         task:scale(time_from_onset_task, scale = FALSE) +   
+                         stim_type:task:scale(surprisal_2, scale = FALSE) +   
+                         stim_type:task:scale(time_from_onset_task, scale = FALSE) +   
+                         (1 + stim_type + task | participant) +
+                         (1 | text_nr),
+                       data = reading_df,
+                       REML = FALSE,
+                       control = lmerControl(optimizer = "bobyqa")
+)
+saveRDS(lmm_reading, file = here("RData/models/lmm_reading.rds")) # save it because it takes forever too compute
+
+check_model(lmm_reading)
+
+summary(lmm_reading)
+anova(lmm_reading)
+
+tab_model(lmm_reading, 
+          gamm_reading, 
+          show.intercept = FALSE,
+          show.icc = TRUE,   # ICC (Intraclass Correlation) is not always needed
+          show.re.var = TRUE,  # Show variance of random effects
+          show.df = FALSE,     # Don't display degrees of freedom
+          show.obs = TRUE,    # Don't display number of observations
+          show.ngroups = FALSE, # Don't display number of groups for random effects
+          show.stat = TRUE,    # Show model statistics (e.g., p-values, F-values)
+          collapse.ci = TRUE,  # Collapse confidence intervals into one line
+          show.std = "std", # Show standardized beta,
+          df.method = "satterthwaite",
+          file = here("reading_models_new.doc"))
+
+# contrast stim_types by task:
+estimate_contrasts(lmm_reading, contrast = "stim_type", by = "task", transform = T, estimate = "average", backend = "emmeans", p_adjust = "holm")
+
+emm <- emmeans(
+  lmm_reading,
+  ~ stim_type * task
+)
+
+contrast(
+  emm,
+  interaction = c("pairwise", "pairwise"),
+  type = "response"
+)
+
+# full pairwise contrast matrix
+emmeans(lmm_reading, pairwise ~ stim_type * task, adjust = "none")
+```
+
+### Plots reading time models
+```{r}
+# GAMM plots ----
+#1) stim type x task x surprisal: three-way interaction from GAMM ----
+# first build a grid for plotting and comparisons
+sm_names <- smooths(gamm_reading)
+rand_terms <- sm_names[grepl("participant|text_nr", sm_names)]
+mf <- model.frame(gamm_reading)
+
+tasks     <- unique(mf$task)
+stimtypes <- unique(mf$stim_type)
+
+# for plotting
+reading_df$stim_task <- interaction(reading_df$stim_type, reading_df$task, drop = TRUE)
+
+# build grid manually to make sure we only include surprisal values in predictions actually present in the different tasks and stimulation conditions (should be balanced)
+reading_grid_surprisal <- do.call(
+  rbind,
+  lapply(tasks, function(tt) {
+    lapply(stimtypes, function(ss) {
+      mf_sub <- subset(mf, task == tt & stim_type == ss)
+
+      datagrid(
+        model = gamm_reading,
+        surprisal_2 = seq(
+          min(mf_sub$surprisal_2, na.rm = TRUE),
+          max(mf_sub$surprisal_2, na.rm = TRUE),
+          length.out = 100
+        ),
+        task       = tt,
+        stim_type  = ss,
+        session    = levels(mf$session),
+        punctuation = levels(mf$punctuation),
+        is_trigger  = levels(mf$is_trigger),
+        reaction    = levels(mf$reaction)
+      )
+    })
+  }) |> unlist(recursive = FALSE)
+)
+
+pred_surprisal <- predictions(
+  gamm_reading,
+  newdata = reading_grid_surprisal,
+  by = c("surprisal_2", "stim_type", "task"),
+  type = "link",
+  transform = exp,
+  exclude = rand_terms
+)
+saveRDS(pred_surprisal, file = here("RData/models/gamm_reading_pred_surprisal.rds"))
+
+pred_surprisal$stim_task <- interaction(pred_surprisal$stim_type, pred_surprisal$task, drop = TRUE)
+
+(RT_reading_stimtype_task_surprisal <- ggplot(pred_surprisal, aes(x = surprisal_2, y = estimate, colour = stim_task, fill = stim_task)) +
+  #geom_jitter2(data = slice_sample(reading_df, prop = 0.1), mapping = aes(x = surprisal_2, y = RT), alpha = 0.02) +
+  geom_rug(
+  data = reading_df |> group_by(stim_task) |> distinct(surprisal_2),
+  aes(x = surprisal_2, colour = stim_task),
+  inherit.aes = FALSE,
+  sides = "b",
+  alpha = 0.12,
+  linewidth = 0.2
+) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 1.1) +
+  facet_wrap(~ task, labeller = labeller(task = c("Reading" = "Reading", "2-back dual" = "Dual task")), scales = "free_x") +
+  ylab("Reading time in ms") +
+  xlab("Lexical surprisal") +
+  coord_cartesian(ylim = c(250, 1290)) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 3)) +
+  #coord_cartesian(ylim = c(400, 1600)) +
+  scale_color_manual(values = cols_reading) +
+  scale_fill_manual(values = cols_reading) +
+  theme_bw(base_size = 9.5)+
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_text(size = 10),
+       axis.text.x = element_text(size = 8.5))
+)
+ggsave(RT_reading_stimtype_task_surprisal, file = here(paste0("Plots/RT_reading_stimtype_task_surprisal_", today, ".png")), width = 90, height = 72, units = "mm")
+
+##1b) Comparison of different smooths ----
+cmp_reading_surprisal <- comparisons(
+  gamm_reading,
+  newdata = reading_grid_surprisal,
+  variables = list(stim_type = "pairwise"),
+  type = "link",
+  transform = exp,
+  exclude = rand_terms,
+  comparison = "difference",
+  #hypothesis = difference ~ reference
+)
+saveRDS(cmp_reading_surprisal, file = here("RData/models/gamm_reading_comp_reading_surprisal.rds"))
+# with transform = exp we get ratio, otherwise we get log ms
+# interpretation: 
+# ratio of 0.9999152 means: for one unit of surprisal, RT is 0.0000848% lower relative to sham, multiply this e.g. by 1000 s to get a better picture: 0.0848 --> after 1000s about 8.5% lower than sham
+
+cmp_df_reading_surprisal <- as.data.frame(cmp_reading_surprisal)
+cmp_df_reading_surprisal$comp_task <- interaction(cmp_df_reading_surprisal$contrast, cmp_df_reading_surprisal$task)
+cmp_df_reading_surprisal$percent_change_rt <- (cmp_df_reading_surprisal$estimate - 1)*100
+cmp_df_reading_surprisal <- cmp_df_reading_surprisal %>% 
+  mutate(significance = case_when(p.value < 0.05 ~ "significant",
+                                  TRUE ~ "not significant"),
+         significance_ribbon = case_when(p.value < 0.05 ~ "significant",
+                                  TRUE ~ "not significant"),
+         significance_line = case_when(p.value < 0.05 ~ "significant",
+                                  TRUE ~ "not significant"))
+
+cmp_df_reading_surprisal <- cmp_df_reading_surprisal |>
+  arrange(task, comp_task, surprisal_2) |>
+  group_by(task, comp_task) |>
+  mutate(seg_id = cumsum(significance != dplyr::lag(significance, default = first(significance)))) |>
+  ungroup()
+
+# for adding vertical lines/geom_rect
+sig_ranges <- cmp_df_reading_surprisal |>
+  filter(significance == "significant") |>
+  group_by(task, comp_task) |>
+  summarise(
+    x_start = min(surprisal_2),
+    x_end   = max(surprisal_2),
+    .groups = "drop")
+
+(RT_comp_reading_stimtype_task_surprisal <- ggplot(subset(cmp_df_reading_surprisal, contrast != "Offline + Online - Offline"), aes(x = surprisal_2, y = percent_change_rt, colour = comp_task, fill = comp_task, group = interaction(comp_task, seg_id))) +
+  #geom_rect(data = sig_ranges, aes(xmin = x_start, xmax = x_end, ymin = -Inf, ymax = Inf), inherit.aes = FALSE, fill  = "grey80", alpha = 0.25) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#3b4856", linewidth = 0.8, alpha = 0.7) +
+  geom_ribbon(aes(ymin = (conf.low-1)*100, ymax = (conf.high-1)*100, alpha = significance_ribbon), colour = NA) +
+  scale_alpha_manual(values = c("not significant" = 0.1, "significant" = 0.3), name = "ribbon") +
+  new_scale("alpha") +
+  geom_line(linewidth = 1.5, aes(alpha = significance_line)) + #aes(linetype = significance)
+  scale_alpha_manual(values = c("not significant" = 0.3, "significant" = 1), name = "line") +
+  #geom_vline(data = sig_ranges, aes(xintercept = x_start), linetype = 2, colour = "black") +
+  #geom_vline(data = sig_ranges, aes(xintercept = x_end), linetype = 2, colour = "black") +
+  facet_wrap(~ task, labeller = labeller(task = c("Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "Dual task")), scales = "free_x") +
+  ylab("% change in RT") +
+  xlab("Lexical surprisal") +
+  scale_y_continuous(limits = c(-14, 13)) +
+  #coord_cartesian(ylim = c(400, 1600)) +
+  scale_color_manual(values = cols_reading[c(2,3,5,6)]) +
+  scale_fill_manual(values = cols_reading[c(2,3,5,6)]) +
+  #scale_linetype_manual(values = c(1,3)) +
+  theme_bw(base_size = 9.5)+
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5))
+)
+ggsave(RT_comp_reading_stimtype_task_surprisal, file = here(paste0("RT_comp_reading_stimtype_task_surprisal_", today, ".png")), width = 50, height = 50, units = "mm")
+
+# also plot online+offline vs offline session
+(RT_comp_reading_stimtype_task_surprisal_active <- ggplot(subset(cmp_df_reading_surprisal, contrast == "Offline + Online - Offline"), aes(x = surprisal_2, y = percent_change_rt, colour = comp_task, fill = comp_task, group = interaction(comp_task, seg_id))) +
+  #geom_rect(data = sig_ranges, aes(xmin = x_start, xmax = x_end, ymin = -Inf, ymax = Inf), inherit.aes = FALSE, fill  = "grey80", alpha = 0.25) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#3b4856", linewidth = 0.8, alpha = 0.7) +
+  geom_ribbon(aes(ymin = (conf.low-1)*100, ymax = (conf.high-1)*100, alpha = significance_ribbon), colour = NA) +
+  scale_alpha_manual(values = c("not significant" = 0.1, "significant" = 0.3), name = "ribbon") +
+  new_scale("alpha") +
+  geom_line(linewidth = 1.5, aes(alpha = significance_line)) + #aes(linetype = significance)
+  scale_alpha_manual(values = c("not significant" = 0.3, "significant" = 1), name = "line") +
+  #geom_vline(data = sig_ranges, aes(xintercept = x_start), linetype = 2, colour = "black") +
+  #geom_vline(data = sig_ranges, aes(xintercept = x_end), linetype = 2, colour = "black") +
+  facet_wrap(~ task, labeller = labeller(task = c("Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "Dual task")), scales = "free_x") +
+  ylab("% change in RT") +
+  xlab("Lexical surprisal") +
+  scale_y_continuous(limits = c(-14, 13)) +
+  #coord_cartesian(ylim = c(400, 1600)) +
+  scale_color_manual(values = cols_reading[c(3,6)]) +
+  scale_fill_manual(values = cols_reading[c(3,6)]) +
+  #scale_linetype_manual(values = c(1,3)) +
+  theme_bw(base_size = 9.5)+
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5))
+)
+ggsave(RT_comp_reading_stimtype_task_surprisal_active, file = here(paste0("RT_comp_reading_stimtype_task_surprisal_active_", today, ".png")), width = 50, height = 50, units = "mm")
+
+##1c) Forest plot: stim type x task x surprisal ----
+cmp_reading_surprisal_selected <- comparisons(
+  gamm_reading,
+  newdata = datagrid(
+    surprisal_2 = c(10, 20, 30),
+    stim_type = unique(mf$stim_type),
+    task = unique(mf$task)
+  ),
+  variables = list(stim_type = "pairwise"),
+  type = "link",
+  transform = exp,
+  exclude = rand_terms,
+  comparison = "difference"
+)
+
+cmp_reading_surprisal_selected <- cmp_reading_surprisal_selected %>% 
+  filter(contrast != "Offline + Online - Offline") %>% 
+  filter(stim_type != "Sham") %>% 
+  mutate(significance = case_when(p.value < 0.05 ~ "*", .default = ""),
+         y_pos = surprisal_2 + case_when(
+           contrast == "Offline - Sham"        ~  1,
+           contrast == "Offline + Online - Sham" ~ -1,
+           TRUE ~ 0),
+         percent_change = (estimate-1)*100,
+         CI_low_percent = (conf.low-1)*100,
+         CI_high_percent = (conf.high-1)*100)
+saveRDS(cmp_reading_surprisal_selected, file = here("RData/models/gamm_reading_comp_reading_surprisal_selected.rds"))
+
+(RT_comp_reading_stimtype_surprisal_forest <- ggplot(cmp_reading_surprisal_selected, aes(x = percent_change, y = y_pos, color = interaction(contrast, task), group = contrast)) +
+  geom_vline(xintercept = 0, color = "#3b4856", linetype = "dashed", linewidth = 0.8, alpha = 0.7) +
+  geom_errorbar(aes(xmin = CI_low_percent, xmax = CI_high_percent), linewidth = .5, orientation = "y", width = 1) +
+  geom_point(shape = 18, size = 4.5) +
+  geom_text(aes(x = conf.high, label = significance), color = "#3b4856", nudge_x = 0.01, hjust = -0.1, vjust = 0.7, size = 5, show.legend = FALSE) +
+  facet_wrap(~ task, labeller = labeller(task = c("Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "Dual task"))) +
+  scale_color_manual(values = cols_reading[c(2,3,5,6)], labels = c("Offline", "Offline + Online"), name = "Condition") +
+  scale_y_continuous(name = "Lexical surprisal", breaks = unique(cmp_reading_surprisal_selected$surprisal_2), labels = unique(cmp_reading_surprisal_selected$surprisal_2)) +
+  scale_x_continuous(name = "% change in RT relative to Sham TMS", limits = c(-12, 12), breaks = c(-12, -6, 0, 6, 12)) +
+  theme_bw(base_size = 9.5) +
+  theme(panel.background  = element_blank(),
+    panel.grid.major  = element_blank(),
+    panel.grid.minor  = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    text = element_text(family = "Helvetica"),
+    axis.line = element_line(),
+    axis.text = element_text(size = 8.5),
+    #axis.title.x = element_text(size = 10),
+    legend.position = "none")
+)
+ggsave(RT_comp_reading_stimtype_surprisal_forest, file = here(paste0("RT_comp_reading_stimtype_surprisal_forest_", today, ".png")), width = 50, height = 50, units = "mm")
+
+##1d) Arrange plot ----
+(figure_RT_reading_surprisal <- ggarrange(RT_reading_stimtype_task_surprisal,
+                                   RT_comp_reading_stimtype_task_surprisal,
+                                   nrow = 1))
+ggsave(figure_RT_reading_surprisal, file = here(paste0("Plots/figure_RT_reading_surprisal_", today, ".pdf")), width = 120, height = 60, units = "mm")
+
+#2) Two-way interaction stim_type x time from GAMM ----
+# first build a grid for plotting and comparisons
+sm_names <- smooths(gamm_reading)
+rand_terms <- sm_names[grepl("participant|text_nr", sm_names)]
+mf <- model.frame(gamm_reading)
+
+stimtypes <- unique(mf$stim_type)
+
+reading_grid_time <- do.call(
+  rbind,
+    lapply(stimtypes, function(ss) {
+      mf_sub <- subset(mf, stim_type == ss)
+      datagrid(
+        model = gamm_reading,
+        time_from_onset_task = seq(
+          min(mf_sub$time_from_onset_task, na.rm = TRUE),
+          max(mf_sub$time_from_onset_task, na.rm = TRUE),
+          length.out = 100
+        ),
+        task       = levels(mf$task),
+        stim_type  = ss,
+        session    = levels(mf$session),
+        punctuation = levels(mf$punctuation),
+        is_trigger  = levels(mf$is_trigger),
+        reaction    = levels(mf$reaction)
+      )
+  })
+)
+
+pred_time <- predictions(
+  gamm_reading,
+  newdata = reading_grid_time,
+  by = c("time_from_onset_task", "stim_type"),
+  type = "link",
+  transform = exp,
+  exclude = rand_terms
+)
+#pred_time$stim_task <- interaction(pred_time$stim_type, pred_time$task)
+saveRDS(pred_time, file = here("RData/models/gamm_reading_pred_time.rds"))
+
+# plot smooths for all stim types
+(RT_reading_stimtype_time <- ggplot(pred_time, aes(x = time_from_onset_task, y = estimate, colour = stim_type, fill = stim_type)) +
+    #geom_jitter2(data = slice_sample(reading_df, prop = .04), mapping = aes(x = time_from_onset_task, y = RT), alpha = 0.02) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, colour = NA) +
+    geom_line(linewidth = 1.1) +
+    #facet_wrap(~ task, labeller = labeller(task = c("Reading" = "Reading", "2-back dual" = "Dual task")), scales = "free_x") +
+    ylab("Reaction time in ms") +
+    xlab("Time since task onset in s") +
+    scale_y_continuous(limits = c(300, 1200)) +
+    scale_x_continuous(breaks = scales::pretty_breaks(n = 3), expand = expansion(mult = c(0.02, 0.15))) +
+    #coord_cartesian(ylim = c(400, 1600)) +
+    scale_color_manual(values = c("#b6b8dd", "#8a8cb0", "#575a7b")) +
+  scale_fill_manual(values = c("#b6b8dd", "#8a8cb0", "#575a7b")) +
+    theme_bw(base_size = 9.5)+
+    theme(legend.position = "none",
+          text = element_text(family = "Helvetica"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          strip.background = element_blank(),
+          strip.text = element_text(size = 10),
+          axis.line = element_line(),
+          axis.text.y = element_text(size = 8.5),
+          #axis.title.x = element_blank(),
+          axis.text.x.bottom = element_text(size = 8.5))
+)
+
+##2b) Comparison of different smooths ----
+# calculate difference smooths
+# takes quite a while to compute, better use pre-computed df
+cmp_reading_time_NoTask <- marginaleffects::avg_comparisons(
+  gamm_reading,
+  newdata = reading_grid_time,
+  variables = list(stim_type = "pairwise"),
+  by = "time_from_onset_task",
+  type = "link",
+  transform = exp,
+  comparison = "difference",
+  exclude = rand_terms
+)
+saveRDS(cmp_reading_time_NoTask, file = here("RData/models/gamm_reading_comp_reading_time_NoTask.rds"))
+
+cmp_df_reading_time <- as.data.frame(cmp_reading_time_NoTask) |>
+  transmute(
+    contrast,
+    time_from_onset_task,
+    estimate,
+    conf.low,
+    conf.high,
+    p.value,
+    percent_change_rt = (estimate - 1) * 100,
+    significance = if_else(p.value < .05, "significant", "not significant")
+  ) %>% 
+  arrange(contrast, time_from_onset_task)
+
+cmp_df_reading_time <- cmp_df_reading_time %>% 
+  mutate(
+    significance = case_when(
+      p.value < 0.05 ~ "significant",
+      TRUE ~ "not significant"
+    ),
+    significance_ribbon = significance,
+    significance_line = significance
+  ) %>% 
+  arrange(contrast, time_from_onset_task) %>% 
+  group_by(contrast) %>% 
+  mutate(
+    seg_id = cumsum(
+      significance != lag(significance, default = first(significance))
+      )) %>% 
+  ungroup()
+
+(RT_comp_reading_stimtype_time <- ggplot(subset(cmp_df_reading_time, contrast != "Offline + Online - Offline"), aes(x = time_from_onset_task, y = percent_change_rt, colour = contrast, fill = contrast)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_ribbon(aes(ymin = (conf.low-1)*100, ymax = (conf.high-1)*100, alpha = significance_ribbon, group = interaction(contrast, seg_id)), colour = NA) +
+  scale_alpha_manual(values = c("not significant" = 0.1, "significant" = 0.3), name = "ribbon") +
+  new_scale("alpha") +
+  geom_line(linewidth = 1.5, aes(alpha = significance_line, group = interaction(contrast, seg_id))) + #aes(linetype = significance)
+  scale_alpha_manual(values = c("not significant" = 0.3, "significant" = 1), name = "line") +
+  ylab("% change in reaction time") +
+  xlab("Time since task onset in s") +
+  #scale_y_continuous(limits = c(300, 1200)) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 3), expand = expansion(mult = c(0.02, 0.15))) +
+  scale_color_manual(values = c("#8a8cb0", "#575a7b")) +
+  scale_fill_manual(values = c("#8a8cb0", "#575a7b")) +
+  #scale_linetype_manual(values = c(1,3)) +
+  theme_bw(base_size = 9.5)+
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5))
+)
+
+# also plot online+offline vs offline 
+(RT_comp_reading_stimtype_time <- ggplot(subset(cmp_df_reading_time, contrast == "Offline + Online - Offline"), aes(x = time_from_onset_task, y = percent_change_rt, colour = contrast, fill = contrast)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_ribbon(aes(ymin = (conf.low-1)*100, ymax = (conf.high-1)*100, alpha = significance_ribbon, group = interaction(contrast, seg_id)), colour = NA) +
+  scale_alpha_manual(values = c("not significant" = 0.1, "significant" = 0.3), name = "ribbon") +
+  new_scale("alpha") +
+  geom_line(linewidth = 1.5, aes(alpha = significance_line, group = interaction(contrast, seg_id))) + #aes(linetype = significance)
+  scale_alpha_manual(values = c("not significant" = 0.3, "significant" = 1), name = "line") +
+  ylab("% change in reaction time") +
+  xlab("Time since task onset in s") +
+  #scale_y_continuous(limits = c(300, 1200)) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 3), expand = expansion(mult = c(0.02, 0.15))) +
+  scale_color_manual(values = c("#8a8cb0", "#575a7b")) +
+  scale_fill_manual(values = c("#8a8cb0", "#575a7b")) +
+  #scale_linetype_manual(values = c(1,3)) +
+  theme_bw(base_size = 9.5)+
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5))
+)
+
+##2c) Arrange plots ----
+(figure_RT_reading_time <- ggarrange(RT_reading_stimtype_time,
+                                   RT_comp_reading_stimtype_time,
+                                   nrow = 1))
+ggsave(figure_RT_reading_time, file = here(paste0("Plots/figure_RT_reading_time_", today, ".pdf")), width = 100, height = 60, units = "mm")
+
+#3) Main effects: time, surprisal, entropy, word length, frequency, previous duration, previous surprisal ----
+## Surprisal ----
+gamm_surprisal <- predict_response(gamm_reading, "surprisal_2", margin = "marginalmeans")
+
+# Use the exact data/subset used to fit the model if possible
+x_limits <- range(
+  c(gamm_surprisal$x, reading_df$surprisal_2),
+  na.rm = TRUE
+)
+
+surprisal_unique <- reading_df |>
+  distinct(word, .keep_all = TRUE) |>
+  filter(!is.na(surprisal_2))
+
+(GAMM_surprisal <- ggplot(gamm_surprisal, aes(x = x, y = predicted)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.25, colour = NA, fill = "#272A50") +
+  geom_line(linewidth = 1.5, colour = "#272A50") +
+  ylab("Reading time in ms") +
+  xlab("Lexical surprisal") +
+  scale_x_continuous(limits = x_limits, breaks = scales::pretty_breaks(n = 5), expand = expansion(mult = c(0.01, 0.01))) +
+  #scale_y_continuous(limits = c(300, 1200)) +
+  theme_bw(base_size = 9.5) +
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5))
+)
+
+GAMM_surprisal_den <- ggplot(surprisal_unique, aes(x = surprisal_2)) +
+  #geom_histogram(bins = 35, fill = "#272A50", colour = "white", linewidth = 0.15, alpha = 0.75) +
+  geom_density(aes(y = after_stat(scaled)), fill = "#272A50", colour = "#272A50", alpha = 0.45, linewidth = 0.5, adjust = .8, trim = TRUE) +
+  scale_x_continuous(limits = x_limits, breaks = scales::pretty_breaks(n = 5), expand = expansion(mult = c(0.01, 0.01))) +
+  labs(x = "Lexical surprisal", y = "Density") +
+  scale_y_continuous(limits = c(0,1), breaks = c(0,1)) +
+  theme_bw(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid = element_blank(),
+    axis.line = element_line(),
+    #axis.title.y = element_blank(),
+    #axis.ticks.y = element_blank(),
+    #axis.text.y = element_blank(),
+    axis.text = element_text(size = 8.5)
+)
+
+(plot_GAMM_surprisal <- GAMM_surprisal / GAMM_surprisal_den +
+  plot_layout(heights = c(4, 1))
+)
+
+## Time ----
+gamm_time <- predict_response(gamm_reading, "time_from_onset_task")
+
+# Use the exact data/subset used to fit the model if possible
+x_limits <- range(
+  c(gamm_time$x, reading_df$time_from_onset_task),
+  na.rm = TRUE
+)
+
+time_unique <- reading_df |>
+  distinct(word, .keep_all = TRUE) |>
+  filter(!is.na(time_from_onset_task))
+
+(GAMM_time <- ggplot(gamm_time, aes(x = x, y = predicted)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.25, colour = NA, fill = "#272A50") +
+  geom_line(linewidth = 1.5, colour = "#272A50") +
+  ylab("Reading time in ms") +
+  xlab("Time since task onset in s") +
+  scale_x_continuous(limits = x_limits, breaks = scales::pretty_breaks(n = 5), expand = expansion(mult = c(0.01, 0.01))) +
+  #scale_y_continuous(limits = c(300, 1200)) +
+  theme_bw(base_size = 9.5) +
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5))
+)
+
+GAMM_time_den <- ggplot(time_unique, aes(x = time_from_onset_task)) +
+  #geom_histogram(bins = 35, fill = "#272A50", colour = "white", linewidth = 0.15, alpha = 0.75) +
+  geom_density(aes(y = after_stat(scaled)), fill = "#272A50", colour = "#272A50", alpha = 0.45, linewidth = 0.5, adjust = .8, trim = TRUE) +
+  scale_x_continuous(limits = x_limits, breaks = scales::pretty_breaks(n = 5), expand = expansion(mult = c(0.01, 0.01))) +
+  labs(x = "Time since task onset in s", y = "Density") +
+  scale_y_continuous(limits = c(0,1), breaks = c(0,1)) +
+  theme_bw(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid = element_blank(),
+    axis.line = element_line(),
+    #axis.title.y = element_blank(),
+    #axis.ticks.y = element_blank(),
+    #axis.text.y = element_blank(),
+    axis.text = element_text(size = 8.5))
+
+(plot_GAMM_time <- GAMM_time / GAMM_time_den +
+  plot_layout(heights = c(4, 1))
+)
+
+
+
+
+## Entropy ----
+gamm_entropy <- predict_response(gamm_reading, "entropy_2", margin = "marginalmeans")
+
+# Use the exact data/subset used to fit the model if possible
+x_limits <- range(
+  c(gamm_entropy$x, reading_df$entropy_2),
+  na.rm = TRUE
+)
+
+entropy_unique <- reading_df |>
+  distinct(word, .keep_all = TRUE) |>
+  filter(!is.na(entropy_2))
+
+(GAMM_entropy <- ggplot(gamm_entropy, aes(x = x, y = predicted)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.25, colour = NA, fill = "#272A50") +
+  geom_line(linewidth = 1.5, colour = "#272A50") +
+  ylab("Reading time in ms") +
+  xlab("Entropy") +
+  scale_x_continuous(limits = x_limits, breaks = scales::pretty_breaks(n = 5), expand = expansion(mult = c(0.01, 0.01))) +
+  #scale_y_continuous(limits = c(300, 1200)) +
+  theme_bw(base_size = 9.5) +
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5))
+)
+
+GAMM_entropy_den <- ggplot(entropy_unique, aes(x = entropy_2)) +
+  #geom_histogram(bins = 35, fill = "#272A50", colour = "white", linewidth = 0.15, alpha = 0.75) +
+  geom_density(aes(y = after_stat(scaled)), fill = "#272A50", colour = "#272A50", alpha = 0.45, linewidth = 0.5, adjust = .8, trim = TRUE) +
+  scale_x_continuous(limits = x_limits, breaks = scales::pretty_breaks(n = 5), expand = expansion(mult = c(0.01, 0.01))) +
+  labs(x = "Entropy", y = "Density") +
+  scale_y_continuous(limits = c(0,1), breaks = c(0,1)) +
+  theme_bw(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid = element_blank(),
+    axis.line = element_line(),
+    #axis.title.y = element_blank(),
+    #axis.ticks.y = element_blank(),
+    #axis.text.y = element_blank(),
+    axis.text = element_text(size = 8.5))
+
+(plot_GAMM_entropy <- GAMM_entropy / GAMM_entropy_den +
+  plot_layout(heights = c(4, 1))
+)
+
+
+
+
+## Frequency ----
+gamm_frequency <- predict_response(gamm_reading, "zipf_frequency", margin = "marginalmeans")
+
+# Use the exact data/subset used to fit the model if possible
+x_limits <- range(
+  c(gamm_frequency$x, reading_df$zipf_frequency),
+  na.rm = TRUE
+)
+
+frequency_unique <- reading_df |>
+  distinct(word, .keep_all = TRUE) |>
+  filter(!is.na(zipf_frequency))
+
+(GAMM_frequency <- ggplot(gamm_frequency, aes(x = x, y = predicted)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.25, colour = NA, fill = "#272A50") +
+  geom_line(linewidth = 1.5, colour = "#272A50") +
+  ylab("Reading time in ms") +
+  xlab("Zipf frequency") +
+  scale_x_continuous(limits = x_limits, breaks = scales::pretty_breaks(n = 5), expand = expansion(mult = c(0.01, 0.01))) +
+  #scale_y_continuous(limits = c(300, 1200)) +
+  theme_bw(base_size = 9.5) +
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5))
+)
+
+GAMM_frequency_den <- ggplot(frequency_unique, aes(x = zipf_frequency)) +
+  #geom_histogram(bins = 35, fill = "#272A50", colour = "white", linewidth = 0.15, alpha = 0.75) +
+  geom_density(aes(y = after_stat(scaled)), fill = "#272A50", colour = "#272A50", alpha = 0.45, linewidth = 0.5, adjust = .8, trim = TRUE) +
+  scale_x_continuous(limits = x_limits, breaks = scales::pretty_breaks(n = 5), expand = expansion(mult = c(0.01, 0.01))) +
+  labs(x = "Zipf frequency", y = "Density") +
+  scale_y_continuous(limits = c(0,1), breaks = c(0,1)) +
+  theme_bw(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid = element_blank(),
+    axis.line = element_line(),
+    #axis.title.y = element_blank(),
+    #axis.ticks.y = element_blank(),
+    #axis.text.y = element_blank(),
+    axis.text = element_text(size = 8.5))
+
+(plot_GAMM_frequency <- GAMM_frequency / GAMM_frequency_den +
+  plot_layout(heights = c(4, 1))
+)
+
+## Word length ----
+gamm_length <- predict_response(gamm_reading, "word_length_single", margin = "marginalmeans")
+
+# Use the exact data/subset used to fit the model if possible
+x_limits <- range(
+  c(gamm_length$x, reading_df$word_length_single),
+  na.rm = TRUE
+)
+
+length_unique <- reading_df |>
+  distinct(word, .keep_all = TRUE) |>
+  filter(!is.na(word_length_single))
+
+(GAMM_length <- ggplot(gamm_length, aes(x = x, y = predicted)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.25, colour = NA, fill = "#272A50") +
+  geom_line(linewidth = 1.5, colour = "#272A50") +
+  ylab("Reading time in ms") +
+  xlab("Word length in characters") +
+  scale_x_continuous(limits = x_limits, breaks = scales::pretty_breaks(n = 5), expand = expansion(mult = c(0.01, 0.01))) +
+  #scale_y_continuous(limits = c(300, 1200)) +
+  theme_bw(base_size = 9.5) +
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5))
+)
+
+GAMM_length_den <- ggplot(length_unique, aes(x = word_length_single)) +
+  #geom_histogram(bins = 35, fill = "#272A50", colour = "white", linewidth = 0.15, alpha = 0.75) +
+  geom_density(aes(y = after_stat(scaled)), fill = "#272A50", colour = "#272A50", alpha = 0.45, linewidth = 0.5, adjust = .8, trim = TRUE) +
+  scale_x_continuous(limits = x_limits, breaks = scales::pretty_breaks(n = 5), expand = expansion(mult = c(0.01, 0.01))) +
+  labs(x = "Word length in characters", y = "Density") +
+  scale_y_continuous(limits = c(0,1), breaks = c(0,1)) +
+  theme_bw(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid = element_blank(),
+    axis.line = element_line(),
+    #axis.title.y = element_blank(),
+    #axis.ticks.y = element_blank(),
+    #axis.text.y = element_blank(),
+    axis.text = element_text(size = 8.5))
+
+(plot_GAMM_length <- GAMM_length / GAMM_length_den +
+  plot_layout(heights = c(4, 1))
+)
+
+
+## Surprisal previous word ----
+gamm_surprisal_prev <- predict_response(gamm_reading, "previous_surprisal_2", margin = "marginalmeans")
+
+# Use the exact data/subset used to fit the model if possible
+x_limits <- range(
+  c(gamm_surprisal_prev$x, reading_df$previous_surprisal_2),
+  na.rm = TRUE
+)
+
+surprisal_prev_unique <- reading_df |>
+  distinct(word, .keep_all = TRUE) |>
+  filter(!is.na(previous_surprisal_2))
+
+(GAMM_surprisal_prev <- ggplot(gamm_surprisal_prev, aes(x = x, y = predicted)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.25, colour = NA, fill = "#272A50") +
+  geom_line(linewidth = 1.5, colour = "#272A50") +
+  ylab("Reading time in ms") +
+  xlab("Previous surprisal") +
+  scale_x_continuous(limits = c(0.004880777,40), breaks = scales::pretty_breaks(n = 5), expand = expansion(mult = c(0.01, 0.01))) +
+  coord_cartesian(ylim = c(650,900)) +
+  #scale_y_continuous(limits = c(300, 1200)) +
+  theme_bw(base_size = 9.5) +
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5))
+)
+
+GAMM_surprisal_prev_den <- ggplot(surprisal_prev_unique, aes(x = previous_surprisal_2)) +
+  #geom_histogram(bins = 35, fill = "#272A50", colour = "white", linewidth = 0.15, alpha = 0.75) +
+  geom_density(aes(y = after_stat(scaled)), fill = "#272A50", colour = "#272A50", alpha = 0.45, linewidth = 0.5, adjust = .8, trim = TRUE) +
+  scale_x_continuous(limits = c(0.004880777,40), breaks = scales::pretty_breaks(n = 5), expand = expansion(mult = c(0.01, 0.01))) +
+  labs(x = "Previous surprisal", y = "Density") +
+  scale_y_continuous(limits = c(0,1), breaks = c(0,1)) +
+  theme_bw(base_size = 9.5) +
+  theme(
+    legend.position = "none",
+    text = element_text(family = "Helvetica"),
+    panel.grid = element_blank(),
+    axis.line = element_line(),
+    #axis.title.y = element_blank(),
+    #axis.ticks.y = element_blank(),
+    #axis.text.y = element_blank(),
+    axis.text = element_text(size = 8.5))
+
+(plot_GAMM_surprisal_prev <- GAMM_surprisal_prev / GAMM_surprisal_prev_den +
+  plot_layout(heights = c(4, 1))
+)
+
+
+
+# LMM plots ----
+##1) stim type x task x surprisal ----
+
+###1a) three-way interaction from LMM ----
+mf <- model.frame(lmm_reading)
+tasks     <- unique(mf$task)
+stimtypes <- unique(mf$stim_type)
+
+# build grid manually to make sure we only include surprisal values in predictions actually present in the different tasks and stimulation conditions (should be balanced)
+reading_grid_surprisal <- do.call(
+  rbind,
+  lapply(tasks, function(tt) {
+    lapply(stimtypes, function(ss) {
+      mf_sub <- subset(mf, task == tt & stim_type == ss)
+
+      datagrid(
+        model = lmm_reading,
+        surprisal_2 = seq(
+          min(mf_sub$`scale(surprisal_2, scale = FALSE)`, na.rm = TRUE),
+          max(mf_sub$`scale(surprisal_2, scale = FALSE)`, na.rm = TRUE),
+          length.out = 100),
+        task       = tt,
+        stim_type  = ss,
+        session    = levels(mf$session),
+        punctuation = levels(mf$punctuation),
+        is_trigger  = levels(mf$is_trigger),
+        reaction    = levels(mf$reaction)
+      )
+    })
+  }) |> unlist(recursive = FALSE)
+)
+
+
+pred_surprisal_lmm <- predictions(
+  lmm_reading,
+  newdata = reading_grid_surprisal,
+  by = c("surprisal_2", "stim_type", "task"),
+  type = "response",
+  transform = exp,
+  re.form = NA
+)
+
+# for plotting
+reading_df$stim_task <- interaction(reading_df$stim_type, reading_df$task, drop = TRUE)
+pred_surprisal_lmm$stim_task <- interaction(pred_surprisal_lmm$stim_type, pred_surprisal_lmm$task, drop = TRUE)
+
+(RT_reading_stimtype_task_surprisal_lmm <- ggplot(pred_surprisal_lmm, aes(x = surprisal_2, y = estimate, colour = stim_task, fill = stim_task)) +
+  geom_jitter2(data = slice_sample(reading_df, prop = 0.1), mapping = aes(x = surprisal_2, y = RT), alpha = 0.02) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 1.1) +
+  facet_wrap(~ task, labeller = labeller(task = c("Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "Dual task"))) +
+  ylab("Reading time in ms") +
+  xlab("Lexical surprisal") +
+  scale_y_continuous(limits = c(400, 1290)) +
+  #coord_cartesian(ylim = c(400, 1600)) +
+  scale_color_manual(values = cols_reading) +
+  scale_fill_manual(values = cols_reading) +
+  theme_bw(base_size = 9.5)+
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_text(size = 10),
+       axis.text.x = element_text(size = 8.5))
+)
+ggsave(RT_reading_stimtype_task_surprisal, file = here(paste0("Plots/RT_reading_stimtype_task_surprisal_", today, ".png")), width = 90, height = 72, units = "mm")
+
+###1b) Comparison of different smooths ----
+cmp_reading_surprisal <- comparisons(
+  lmm_reading,
+  newdata = reading_grid_surprisal,
+  variables = list(stim_type = "pairwise"),
+  type = "response",
+  transform = exp,
+  re.form = NA,
+  comparison = "difference",
+  #hypothesis = difference ~ reference
+)
+# with transform = exp we get ratio, otherwise we get log ms
+# interpretation: 
+# ratio of 0.9999152 means: for one unit of surprisal, RT is 0.0000848% lower relative to sham, multiply this e.g. by 1000 s to get a better picture: 0.0848 --> after 1000s about 8.5% lower than sham
+
+cmp_df_reading_surprisal <- as.data.frame(cmp_reading_surprisal)
+cmp_df_reading_surprisal$comp_task <- interaction(cmp_df_reading_surprisal$contrast, cmp_df_reading_surprisal$task)
+cmp_df_reading_surprisal$percent_change_rt <- (cmp_df_reading_surprisal$estimate - 1)*100
+cmp_df_reading_surprisal <- cmp_df_reading_surprisal %>% 
+  mutate(significance = case_when(p.value < 0.05 ~ "significant",
+                                  TRUE ~ "not significant"),
+         significance_ribbon = case_when(p.value < 0.05 ~ "significant",
+                                  TRUE ~ "not significant"),
+         significance_line = case_when(p.value < 0.05 ~ "significant",
+                                  TRUE ~ "not significant"))
+
+cmp_df_reading_surprisal <- cmp_df_reading_surprisal |>
+  arrange(task, comp_task, surprisal_2) |>
+  group_by(task, comp_task) |>
+  mutate(seg_id = cumsum(significance != dplyr::lag(significance, default = first(significance)))) |>
+  ungroup()
+
+# for adding vertical lines/geom_rect
+sig_ranges <- cmp_df_reading_surprisal |>
+  filter(significance == "significant") |>
+  group_by(task, comp_task) |>
+  summarise(
+    x_start = min(surprisal_2),
+    x_end   = max(surprisal_2),
+    .groups = "drop")
+
+(RT_comp_reading_stimtype_task_surprisal <- ggplot(subset(cmp_df_reading_surprisal, contrast != "Offline + Online - Offline"), aes(x = surprisal_2, y = percent_change_rt, colour = comp_task, fill = comp_task, group = interaction(comp_task, seg_id))) +
+  #geom_rect(data = sig_ranges, aes(xmin = x_start, xmax = x_end, ymin = -Inf, ymax = Inf), inherit.aes = FALSE, fill  = "grey80", alpha = 0.25) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#3b4856", linewidth = 0.8, alpha = 0.7) +
+  geom_ribbon(aes(ymin = (conf.low-1)*100, ymax = (conf.high-1)*100, alpha = significance_ribbon), colour = NA) +
+  scale_alpha_manual(values = c("not significant" = 0.1, "significant" = 0.3), name = "ribbon") +
+  new_scale("alpha") +
+  geom_line(linewidth = 1.5, aes(alpha = significance_line)) + #aes(linetype = significance)
+  scale_alpha_manual(values = c("not significant" = 0.3, "significant" = 1), name = "line") +
+  #geom_vline(data = sig_ranges, aes(xintercept = x_start), linetype = 2, colour = "black") +
+  #geom_vline(data = sig_ranges, aes(xintercept = x_end), linetype = 2, colour = "black") +
+  facet_wrap(~ task, labeller = labeller(task = c("Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "Dual task")), scales = "free_x") +
+  ylab("% change in RT") +
+  xlab("Lexical surprisal") +
+  scale_y_continuous(limits = c(-14, 13)) +
+  #coord_cartesian(ylim = c(400, 1600)) +
+  scale_color_manual(values = cols_reading[c(2,3,5,6)]) +
+  scale_fill_manual(values = cols_reading[c(2,3,5,6)]) +
+  #scale_linetype_manual(values = c(1,3)) +
+  theme_bw(base_size = 9.5)+
+  theme(legend.position = "bottom",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5))
+)
+ggsave(RT_comp_reading_stimtype_task_surprisal, file = here(paste0("RT_comp_reading_stimtype_task_surprisal_", today, ".png")), width = 50, height = 50, units = "mm")
+
+# also plot online+offline vs offline session
+(RT_comp_reading_stimtype_task_surprisal_active <- ggplot(subset(cmp_df_reading_surprisal, contrast == "Offline + Online - Offline"), aes(x = surprisal_2, y = percent_change_rt, colour = comp_task, fill = comp_task, group = interaction(comp_task, seg_id))) +
+  #geom_rect(data = sig_ranges, aes(xmin = x_start, xmax = x_end, ymin = -Inf, ymax = Inf), inherit.aes = FALSE, fill  = "grey80", alpha = 0.25) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#3b4856", linewidth = 0.8, alpha = 0.7) +
+  geom_ribbon(aes(ymin = (conf.low-1)*100, ymax = (conf.high-1)*100, alpha = significance_ribbon), colour = NA) +
+  scale_alpha_manual(values = c("not significant" = 0.1, "significant" = 0.3), name = "ribbon") +
+  new_scale("alpha") +
+  geom_line(linewidth = 1.5, aes(alpha = significance_line)) + #aes(linetype = significance)
+  scale_alpha_manual(values = c("not significant" = 0.3, "significant" = 1), name = "line") +
+  #geom_vline(data = sig_ranges, aes(xintercept = x_start), linetype = 2, colour = "black") +
+  #geom_vline(data = sig_ranges, aes(xintercept = x_end), linetype = 2, colour = "black") +
+  facet_wrap(~ task, labeller = labeller(task = c("Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "Dual task")), scales = "free_x") +
+  ylab("% change in RT") +
+  xlab("Lexical surprisal") +
+  scale_y_continuous(limits = c(-14, 13)) +
+  #coord_cartesian(ylim = c(400, 1600)) +
+  scale_color_manual(values = cols_reading[c(3,6)]) +
+  scale_fill_manual(values = cols_reading[c(3,6)]) +
+  #scale_linetype_manual(values = c(1,3)) +
+  theme_bw(base_size = 9.5)+
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5))
+)
+ggsave(RT_comp_reading_stimtype_task_surprisal_active, file = here(paste0("RT_comp_reading_stimtype_task_surprisal_active_", today, ".png")), width = 50, height = 50, units = "mm")
+
+###1c) Forest plot: stim type x task x surprisal ----
+cmp_reading_surprisal_selected <- comparisons(
+  gamm_reading,
+  newdata = datagrid(
+    surprisal_2 = c(10, 20, 30),
+    stim_type = unique(mf$stim_type),
+    task = unique(mf$task)
+  ),
+  variables = list(stim_type = "pairwise"),
+  type = "link",
+  transform = exp,
+  exclude = rand_terms,
+  comparison = "difference"
+)
+
+cmp_reading_surprisal_selected <- cmp_reading_surprisal_selected %>% 
+  filter(contrast != "Offline + Online - Offline") %>% 
+  filter(stim_type != "Sham") %>% 
+  mutate(significance = case_when(p.value < 0.05 ~ "*", .default = ""),
+         y_pos = surprisal_2 + case_when(
+           contrast == "Offline - Sham"        ~  1,
+           contrast == "Offline + Online - Sham" ~ -1,
+           TRUE ~ 0),
+         percent_change = (estimate-1)*100,
+         CI_low_percent = (conf.low-1)*100,
+         CI_high_percent = (conf.high-1)*100)
+saveRDS(cmp_reading_surprisal_selected, file = here("RData/models/gamm_reading_comp_reading_surprisal_selected.rds"))
+
+(RT_comp_reading_stimtype_surprisal_forest <- ggplot(cmp_reading_surprisal_selected, aes(x = percent_change, y = y_pos, color = interaction(contrast, task), group = contrast)) +
+  geom_vline(xintercept = 0, color = "#3b4856", linetype = "dashed", linewidth = 0.8, alpha = 0.7) +
+  geom_errorbar(aes(xmin = CI_low_percent, xmax = CI_high_percent), linewidth = .5, orientation = "y", width = 1) +
+  geom_point(shape = 18, size = 4.5) +
+  geom_text(aes(x = conf.high, label = significance), color = "#3b4856", nudge_x = 0.01, hjust = -0.1, vjust = 0.7, size = 5, show.legend = FALSE) +
+  facet_wrap(~ task, labeller = labeller(task = c("Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "Dual task"))) +
+  scale_color_manual(values = cols_reading[c(2,3,5,6)], labels = c("Offline", "Offline + Online"), name = "Condition") +
+  scale_y_continuous(name = "Lexical surprisal", breaks = unique(cmp_reading_surprisal_selected$surprisal_2), labels = unique(cmp_reading_surprisal_selected$surprisal_2)) +
+  scale_x_continuous(name = "% change in RT relative to Sham TMS", limits = c(-12, 12), breaks = c(-12, -6, 0, 6, 12)) +
+  theme_bw(base_size = 9.5) +
+  theme(panel.background  = element_blank(),
+    panel.grid.major  = element_blank(),
+    panel.grid.minor  = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10),
+    text = element_text(family = "Helvetica"),
+    axis.line = element_line(),
+    axis.text = element_text(size = 8.5),
+    #axis.title.x = element_text(size = 10),
+    legend.position = "none")
+)
+ggsave(RT_comp_reading_stimtype_surprisal_forest, file = here(paste0("RT_comp_reading_stimtype_surprisal_forest_", today, ".png")), width = 50, height = 50, units = "mm")
+
+##2) Two-way interaction stim_type x time from LMM ----
+# first build a grid for plotting and comparisons
+mf <- model.frame(lmm_reading)
+stimtypes <- unique(mf$stim_type)
+
+reading_grid_time <- do.call(
+  rbind,
+    lapply(stimtypes, function(ss) {
+      mf_sub <- subset(mf, stim_type == ss)
+      datagrid(
+        model = lmm_reading,
+        time_from_onset_task = seq(
+          min(mf_sub$`scale(time_from_onset_task, scale = FALSE)`, na.rm = TRUE),
+          max(mf_sub$`scale(time_from_onset_task, scale = FALSE)`, na.rm = TRUE),
+          length.out = 100
+        ),
+        task       = levels(mf$task),
+        stim_type  = ss,
+        session    = levels(mf$session),
+        punctuation = levels(mf$punctuation),
+        is_trigger  = levels(mf$is_trigger),
+        reaction    = levels(mf$reaction)
+      )
+  })
+)
+
+pred_time_lmm <- predictions(
+  lmm_reading,
+  newdata = reading_grid_time,
+  by = c("time_from_onset_task", "stim_type"),
+  type = "response",
+  transform = exp,
+  re.form = NA
+)
+
+# plot smooths for all stim types
+(RT_reading_stimtype_time <- ggplot(pred_time_lmm, aes(x = time_from_onset_task, y = estimate, colour = stim_type, fill = stim_type)) +
+    geom_jitter2(data = slice_sample(reading_df, prop = .04), mapping = aes(x = time_from_onset_task, y = RT), alpha = 0.02) +
+    geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, colour = NA) +
+    geom_line(linewidth = 1.1) +
+    #facet_wrap(~ task, labeller = labeller(task = c("Reading" = "Reading", "2-back dual" = "Dual task")), scales = "free_x") +
+    ylab("Reaction time in ms") +
+    xlab("Time since task onset in s") +
+    scale_y_continuous(limits = c(300, 1200)) +
+    scale_x_continuous(breaks = scales::pretty_breaks(n = 3), expand = expansion(mult = c(0.02, 0.15))) +
+    #coord_cartesian(ylim = c(400, 1600)) +
+    scale_color_manual(values = c("#b6b8dd", "#8a8cb0", "#575a7b")) +
+  scale_fill_manual(values = c("#b6b8dd", "#8a8cb0", "#575a7b")) +
+    theme_bw(base_size = 9.5)+
+    theme(legend.position = "none",
+          text = element_text(family = "Helvetica"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          strip.background = element_blank(),
+          strip.text = element_text(size = 10),
+          axis.line = element_line(),
+          axis.text.y = element_text(size = 8.5),
+          #axis.title.x = element_blank(),
+          axis.text.x.bottom = element_text(size = 8.5))
+)
+
+### Comparison of different smooths ----
+cmp_reading_time_NoTask <- marginaleffects::avg_comparisons(
+  lmm_reading,
+  newdata = reading_grid_time,
+  variables = list(stim_type = "pairwise"),
+  by = "time_from_onset_task",
+  type = "response",
+  transform = exp,
+  comparison = "difference",
+  re.form = NA
+)
+saveRDS(cmp_reading_time_NoTask, file = here("RData/models/gamm_reading_comp_reading_time_NoTask.rds"))
+
+cmp_df_reading_time <- as.data.frame(cmp_reading_time_NoTask) |>
+  transmute(
+    contrast,
+    time_from_onset_task,
+    estimate,
+    conf.low,
+    conf.high,
+    p.value,
+    percent_change_rt = (estimate - 1) * 100,
+    significance = if_else(p.value < .05, "significant", "not significant")
+  ) %>% 
+  arrange(contrast, time_from_onset_task)
+
+cmp_df_reading_time <- cmp_df_reading_time %>% 
+  mutate(
+    significance = case_when(
+      p.value < 0.05 ~ "significant",
+      TRUE ~ "not significant"
+    ),
+    significance_ribbon = significance,
+    significance_line = significance
+  ) %>% 
+  arrange(contrast, time_from_onset_task) %>% 
+  group_by(contrast) %>% 
+  mutate(
+    seg_id = cumsum(
+      significance != lag(significance, default = first(significance))
+      )) %>% 
+  ungroup()
+
+(RT_comp_reading_stimtype_time <- ggplot(subset(cmp_df_reading_time, contrast != "Offline + Online - Offline"), aes(x = time_from_onset_task, y = percent_change_rt, colour = contrast, fill = contrast)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_ribbon(aes(ymin = (conf.low-1)*100, ymax = (conf.high-1)*100, alpha = significance_ribbon, group = interaction(contrast, seg_id)), colour = NA) +
+  scale_alpha_manual(values = c("not significant" = 0.1, "significant" = 0.3), name = "ribbon") +
+  new_scale("alpha") +
+  geom_line(linewidth = 1.5, aes(alpha = significance_line, group = interaction(contrast, seg_id))) + #aes(linetype = significance)
+  scale_alpha_manual(values = c("not significant" = 0.3, "significant" = 1), name = "line") +
+  ylab("% change in reaction time") +
+  xlab("Time since task onset in s") +
+  #scale_y_continuous(limits = c(300, 1200)) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 3), expand = expansion(mult = c(0.02, 0.15))) +
+  scale_color_manual(values = c("#8a8cb0", "#575a7b")) +
+  scale_fill_manual(values = c("#8a8cb0", "#575a7b")) +
+  #scale_linetype_manual(values = c(1,3)) +
+  theme_bw(base_size = 9.5)+
+  theme(legend.position = "bottom",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5))
+)
+
+(RT_comp_reading_stimtype_time <- ggplot(subset(cmp_df_reading_time, contrast == "Offline + Online - Offline"), aes(x = time_from_onset_task, y = percent_change_rt, colour = contrast, fill = contrast)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_ribbon(aes(ymin = (conf.low-1)*100, ymax = (conf.high-1)*100, alpha = significance_ribbon, group = interaction(contrast, seg_id)), colour = NA) +
+  scale_alpha_manual(values = c("not significant" = 0.1, "significant" = 0.3), name = "ribbon") +
+  new_scale("alpha") +
+  geom_line(linewidth = 1.5, aes(alpha = significance_line, group = interaction(contrast, seg_id))) + #aes(linetype = significance)
+  scale_alpha_manual(values = c("not significant" = 0.3, "significant" = 1), name = "line") +
+  ylab("% change in reaction time") +
+  xlab("Time since task onset in s") +
+  #scale_y_continuous(limits = c(300, 1200)) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 3), expand = expansion(mult = c(0.02, 0.15))) +
+  scale_color_manual(values = c("#8a8cb0", "#575a7b")) +
+  scale_fill_manual(values = c("#8a8cb0", "#575a7b")) +
+  #scale_linetype_manual(values = c(1,3)) +
+  theme_bw(base_size = 9.5)+
+  theme(legend.position = "bottom",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5))
+)
+
+##3) Parametric effects LMM ----
+pred_lmm <- predictions(
+  lmm_reading,
+  by = c("stim_type", "task"),
+  type = "response",
+  transform = exp,
+  re.form = NA
+)
+pred_lmm$stim_task <- interaction(pred_lmm$stim_type, pred_lmm$task, drop = TRUE)
+
+stim_task_labels <- c(
+  "Sham.Reading" = "Sham",
+  "Offline.Reading" = "Offline",
+  "Offline + Online.Reading" = "Offline+Online",
+  "Sham.2-back dual" = "Sham",
+  "Offline.2-back dual" = "Offline",
+  "Offline + Online.2-back dual" = "Offline+Online"
+)
+
+(LMM_RT_reading_stim_type_task <- ggplot(pred_lmm, aes(x = stim_task, y = estimate, color = stim_task, group = stim_task, fill = stim_task)) +
+  #geom_point(data = reading_df, mapping = aes(x = task, y = RT, color = stim_task), alpha = 1, position=position_jitterdodge()) +
+  geom_point(position = position_dodge(width = 1), size = 3, shape = 23) +
+  geom_errorbar(mapping = aes(ymin = conf.low, ymax = conf.high), width = 0.15, position = position_dodge(width = 1), linewidth = 1) +
+  ylab("Reading time in ms") +
+  xlab("Task") +
+  #scale_y_continuous(limits = c(300, 950)) +
+  #scale_x_discrete(labels = c("Reading", "Dual task")) +
+  scale_x_discrete(labels = stim_task_labels) +
+  coord_cartesian(ylim = c(380, 950)) +
+  scale_color_manual(values = cols_reading) +
+  scale_fill_manual(values = cols_reading) +
+  theme_bw(base_size = 9.5) +
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       #strip.text = element_blank(),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       axis.title.x = element_blank(),
+       axis.text.x = element_text(size = 8.5, angle = 45, vjust = 1, hjust = 1))
+)
+ggsave(LMM_RT_reading_stim_type_task, file = here(paste0("Plots/LMM_RT_reading_stim_type_task_", today, ".pdf")), width = 50, height = 65, units = "mm")
+
+##4) GAMM vs LMM ----
+pred_surprisal_gamm <- pred_surprisal
+pred_surprisal_lmm <- predictions(
+  lmm_reading,
+  newdata = reading_grid_surprisal,
+  by = c("surprisal_2", "stim_type", "task"),
+  type = "response",
+  transform = exp,
+  re.form = NA
+)
+
+pred_surprisal_gamm$stim_task <- interaction(pred_surprisal_gamm$stim_type, pred_surprisal_gamm$task, drop = TRUE)
+pred_surprisal_gamm$model <- "GAMM"
+pred_surprisal_lmm$stim_task <- interaction(pred_surprisal_lmm$stim_type, pred_surprisal_lmm$task, drop = TRUE)
+pred_surprisal_lmm$model <- "LMM"
+
+data_fig_models <- rbind(pred_surprisal_gamm, pred_surprisal_lmm)
+
+(RT_reading_stimtype_task_surprisal_LMM_GAMM <- ggplot(data_fig_models, aes(x = surprisal_2, y = estimate, colour = stim_task, fill = stim_task)) +
+  geom_jitter2(data = reading_df, mapping = aes(x = surprisal_2, y = RT), alpha = 0.1) +
+  #geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, colour = NA) +
+  geom_line(aes(linetype = model), linewidth = 1.5, color = "black") +
+  facet_wrap(~ task + stim_type) +
+  ylab("Reaction time in ms") +
+  xlab("Lexical surprisal") +
+  scale_y_continuous(limits = c(340, 1500)) +
+  #coord_cartesian(ylim = c(400, 1600)) +
+  scale_color_manual(values = cols_reading) +
+  #scale_fill_manual(values = cols_reading) +
+  theme_bw(base_size = 10)+
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       #strip.text = element_blank(),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 9),
+       #axis.title.x = element_text(size = 10),
+       axis.text.x = element_text(size = 9))
+)
+
+
+
+
+##4c) Main plots ----
+(figure_RT_reading <- ggarrange(LMM_RT_reading_stim_type_task,
+                                RT_reading_stimtype_task_surprisal +
+                                  theme(axis.title.y = element_blank(),
+                                  axis.text.y = element_blank(),
+                                  axis.ticks.y = element_blank(),
+                                  axis.line.y = element_blank()),
+                                RT_reading_stimtype_task_time +
+                                  theme(axis.title.y = element_blank(),
+                                  axis.text.y = element_blank(),
+                                  axis.ticks.y = element_blank(),
+                                  axis.line.y = element_blank()),
+                                nrow = 2, 
+                                widths = c(0.35,1,1))
+  
+)
+ggsave(figure_RT_reading, file = here(paste0("Plots/figure_RT_reading_", today, ".png")), width = 180, height = 65, units = "mm")
+
+##4d) Difference smooths surprisal ----
+(figure_RT_reading_surprisal <- ggarrange(RT_comp_reading_stimtype_task_surprisal,
+                                RT_comp_reading_stimtype_surprisal_forest,
+                                RT_comp_reading_stimtype_task_surprisal_active,
+                                nrow = 1, 
+                                widths = c(.85,1.05,.85))
+  
+)
+ggsave(figure_RT_reading_surprisal, file = here(paste0("Plots/figure_RT_reading_surprisal_", today, ".pdf")), width = 180, height = 65, units = "mm")
+
+##4e) Difference smooths time ----
+(figure_RT_reading_time <- ggarrange(RT_comp_reading_stimtype_task_time,
+                                RT_comp_reading_stimtype_time_forest,
+                                RT_comp_reading_stimtype_task_time_active,
+                                nrow = 1, 
+                                widths = c(.85,1.05,.85))
+  
+)
+ggsave(figure_RT_reading_time, file = here(paste0("Plots/figure_RT_reading_time_", today, ".pdf")), width = 180, height = 65, units = "mm")
+
+##4f) Online TMS plot ----
+(figure_RT_reading_online <- ggarrange(RT_reading_stimtype_task_time_online +
+                                          theme(axis.title.x = element_blank()),
+                                RT_comp_reading_stimtype_task_time_online +
+                                  theme(axis.title.x = element_blank()),
+                                nrow = 1)
+  
+)
+ggsave(figure_RT_reading_online, file = here(paste0("Plots/figure_RT_reading_online_", today, ".pdf")), width = 120, height = 60, units = "mm")
+
+
+# old stuff but maybe useful ----
+pred_gamm_reading_RT_stimType_task_surprisal <- estimate_slopes(gamm_reading, by = c("stim_type", "task"), trend = "surprisal_2", transform = TRUE, backend = "marginalmeans", include_random = TRUE)
+
+plot(pred_gamm_reading_RT_stimType_task_surprisal)
+
+#pred_gamm_nback_RT_stimType_task2 <- avg_predictions(gamm_RT_only_nback, variables = c("task", "stim_type"), type = "response", transform = exp)
+#plot_predictions(gamm_RT_only_nback, condition = c("stim_type", "task"), type = "response", transform = exp)
+
+# plot the predicted values
+(plot_gamm_nback_RT_stimType_task <- ggplot(pred_gamm_reading_RT_stimType_task_surprisal, aes(x = stim_type, y = Slope, color = task, fill = task)) +
+   geom_point2(size = 3, position = position_dodge(width = 0.5)) +
+   geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 0.2, position = position_dodge(width = 0.5)) +
+   geom_line(aes(group = task), position = position_dodge(width = 0.5), alpha = 0.75, linetype = "dashed") +
+   #geom_violinhalf(data = nback_only_nback_trials, aes(x = task, y = RT), position = position_dodge(width = 0.4), trim = T) +
+   ylab("N-back reaction time in ms") +
+   xlab("Stimulation condition") +
+   #coord_cartesian(ylim=c(800, 1100)) +
+   scale_color_manual(values = cols_nback) +  
+   scale_fill_manual(values = cols_nback) +  
+   theme_bw() +
+   theme(legend.position = "bottom",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         strip.background = element_blank(),
+         axis.line = element_line(),
+         #axis.title.y = element_text(size = 8),
+         axis.text.y = element_text(size = 10),
+         axis.text.x = element_text(size = 10))
+         #axis.title = element_blank())
+)
+
+ggsave(plot_gamm_nback_RT_stimType_task, file = here::here("Plots/plot_gamm_nback_RT_stimType_task.rds"))
+
+estimate_contrasts(gamm_reading, contrast = c("stim_type"), by = c("task"), transform = TRUE, p_adjust = "fdr", comparison = "reference", integer_as_continuous = TRUE, backend = "marginalmeans")
+
+### Compare time slopes ----
+slopes_gamm_nback_RT_stimType_time <- estimate_slopes(gamm_RT_only_nback, 
+                                                      by = c("stim_type"), 
+                                                      trend = "time_from_onset_session", 
+                                                      transform = TRUE, # with transform = TRUE we get ratio, otherwise we get log ms
+                                                      hypothesis = difference ~ reference, # gives us the difference in slope
+                                                      multcomp = "holm") 
+# interpretation: 
+# ratio of 0.9999152 means: for one s RT is 0.0000848% lower relative to sham, multiply this e.g. by 1000 s to get a better picture: 0.0848 --> after 1000s about 8.5% lower than sham
+
+# alternative that works equally well:
+#estimate_contrasts(gamm_RT_only_nback, contrast = c("time_from_onset_session"), by = c("stim_type"), p_adjust = "fdr", comparison = "pairwise", integer_as_continuous = TRUE, backend = "emmeans", predict = "response", transform = T)
+
+slopes_gamm_nback_RT_stimType_time
+plot(slopes_gamm_nback_RT_stimType_time)
+
+```
+
+## ONLINE TMS: Reading time analysis ----
+```{r}
+reading_df_online <- subset(reading_df, is_trigger == "True")
+reading_df_online <- droplevels(reading_df_online)
+
+# new contrast coding for stim type since we're loosing one level
+c <- contr.treatment(2) 
+my.coding <- matrix(rep(1/2, 2), ncol = 1) 
+my.simple <- c-my.coding
+
+contrasts(reading_df_online$stim_type) <- my.simple
+
+reading_df_online$reaction <- as.factor(reading_df_online$reaction)
+contrasts(reading_df_online$reaction) <- my.simple
+
+reading_df_online$task <- factor(reading_df_online$task, levels = c("Reading", "2-back dual"))
+contrasts(reading_df_online$task) <- my.simple
+
+# simple coding for session
+c <- contr.treatment(3) 
+my.coding <- matrix(rep(1/3, 6), ncol = 2) 
+my.simple <- c-my.coding
+
+reading_df_online$session <- as.factor(reading_df_online$session)
+contrasts(reading_df_online$session) <- my.simple
+
+# simple coding for punctuation (5 levels)
+c <- contr.treatment(5) 
+my.coding <- matrix(rep(1/5, 20), ncol = 4) 
+my.simple <- c-my.coding
+
+reading_df_online$punctuation <- as.factor(reading_df_online$punctuation)
+contrasts(reading_df_online$punctuation) <- my.simple
+
+## GAMM ----
+reading_df_online <- reading_df_online %>% 
+  ungroup() %>% 
+  mutate(across(where(is.character), as.factor))
+
+gamm_reading_online <- bam(log(RT) ~ 
+            # parametric main effects and interactions (factors)  
+              #stim_type + 
+              #task +
+              session + 
+              reaction +
+              punctuation +
+              RS +
+              executive_sum +
+              education_years +
+              Age +
+              sideEffects_sum +
+              #stim_type:task + 
+            # non-parametric main effects (smooths)
+              s(time_from_onset_task, k = 20) + 
+              s(surprisal_2, k = 20) + 
+              s(entropy_2, k = 30) +
+              s(word_length_single, k = 20) + 
+              s(zipf_frequency, k = 20) +
+            # interactions
+              s(stim_type, time_from_onset_task, bs = "sz", k = 20) + 
+              s(task, time_from_onset_task, bs = "sz", k = 20) + 
+              s(stim_type, task, time_from_onset_task, bs = "sz", k = 20) + 
+              #s(time_from_onset_task, by = stimType_task, k = 20) +
+              
+              s(stim_type, surprisal_2, bs = "sz", k = 20) + 
+              s(task, surprisal_2, bs = "sz", k = 20) + 
+              s(stim_type, task, surprisal_2, bs = "sz", k = 20) + 
+              #s(surprisal_2, by = stimType_task, k = 20) + 
+            # random terms
+              s(participant, bs = "re") +
+              s(participant, stim_type, bs = "re") +
+              s(participant, task, bs = "re") +  
+              s(surprisal_2, participant, bs = "fs", k = 10) +
+              s(time_from_onset_task, participant, bs = "fs") +
+              s(text_nr, bs = "re"),
+    data = reading_df_online,
+    method = "fREML",
+    discrete = TRUE,
+    control = gam.control(nthreads = n.cores)
+)
+
+k.check(gamm_reading_online, n.rep = 1000)
+
+summary(gamm_reading_online)
+
+## LMM ----
+lmm_reading_online <- lmerTest::lmer(log(RT) ~
+                         stim_type +
+                         session +
+                         task +
+                         reaction + 
+                         punctuation +
+                         scale(time_from_onset_task, scale = FALSE) +   
+                         scale(RS, scale = FALSE) +
+                         scale(executive_sum, scale = FALSE) +
+                         scale(education_years, scale = FALSE) +
+                         scale(Age, scale = FALSE) +
+                         scale(sideEffects_sum, scale = FALSE) +
+                         scale(surprisal_2, scale = FALSE) + # slope yes
+                         scale(entropy_2, scale = FALSE) + # slope no
+                         scale(zipf_frequency, scale = FALSE) + # slope no
+                         scale(word_length_single, scale = FALSE) + # slope no
+                         stim_type:task +
+                         stim_type:scale(time_from_onset_task, scale = FALSE) +   
+                         stim_type:scale(surprisal_2, scale = FALSE) +   
+                         task:scale(surprisal_2, scale = FALSE) + 
+                         task:scale(time_from_onset_task, scale = FALSE) + 
+                         stim_type:task:scale(surprisal_2, scale = FALSE) +  
+                         stim_type:task:scale(time_from_onset_task, scale = FALSE) +  
+                         (1 + stim_type + task | participant),
+                       data = reading_df_online,
+                       REML = FALSE,
+                       control = lmerControl(optimizer = "bobyqa")
+)
+
+summary(lmm_reading_online)
+anova(lmm_reading_online)
+
+# contrast stim_types by task:
+estimate_contrasts(lmm_reading_online, contrast = "stim_type", by = "task", transform = T, estimate = "average", backend = "emmeans")
+
+tab_model(lmm_reading_online, 
+          gamm_reading_online, 
+          show.intercept = FALSE,
+          show.icc = TRUE,   # ICC (Intraclass Correlation) is not always needed
+          show.re.var = TRUE,  # Show variance of random effects
+          show.df = FALSE,     # Don't display degrees of freedom
+          show.obs = TRUE,    # Don't display number of observations
+          show.ngroups = FALSE, # Don't display number of groups for random effects
+          show.stat = TRUE,    # Show model statistics (e.g., p-values, F-values)
+          collapse.ci = TRUE,  # Collapse confidence intervals into one line
+          show.std = "std", # Show standardized beta,
+          df.method = "satterthwaite",
+          file = here("reading_models_online.doc"))
+
+plot(predict_response(lmm_reading_online, c("task", "stim_type"), margin = "marginalmeans"))
+emmeans(lmm_reading_online, pairwise ~ stim_type * task, adjust = "none")
+```
+
+### Plots reading time models
+```{r}
+# GAMM plots ----
+##1) ONLINE trials: stim type x task x time – three-way interaction from online trials GAMM ----
+# first build a grid for plotting and comparisons
+sm_names <- smooths(gamm_reading_online)
+rand_terms <- sm_names[grepl("participant|text_nr", sm_names)]
+mf <- model.frame(gamm_reading_online)
+
+tasks     <- unique(mf$task)
+stimtypes <- unique(mf$stim_type)
+
+# for plotting
+reading_df_online$stim_task <- interaction(reading_df_online$stim_type, reading_df_online$task, drop = TRUE)
+
+# build grid manually to make sure we only include surprisal values in predictions actually present in the different tasks and stimulation conditions (should be balanced)
+reading_grid_time_online <- do.call(
+  rbind,
+  lapply(tasks, function(tt) {
+    lapply(stimtypes, function(ss) {
+      mf_sub <- subset(mf, task == tt & stim_type == ss)
+
+      datagrid(
+        model = gamm_reading_online,
+        time_from_onset_task = seq(
+          min(mf_sub$time_from_onset_task, na.rm = TRUE),
+          max(mf_sub$time_from_onset_task, na.rm = TRUE),
+          length.out = 100
+        ),
+        task       = tt,
+        stim_type  = ss,
+        session    = levels(mf$session),
+        punctuation = levels(mf$punctuation),
+        reaction    = levels(mf$reaction)
+      )
+    })
+  }) |> unlist(recursive = FALSE)
+)
+
+pred_time_online <- predictions(
+  gamm_reading_online,
+  newdata = reading_grid_time_online,
+  by = c("time_from_onset_task", "stim_type", "task"),
+  type = "link",
+  transform = exp,
+  exclude = rand_terms
+)
+#saveRDS(pred_surprisal, file = here("RData/models/gamm_reading_pred_surprisal.rds"))
+
+pred_time_online$stim_task <- interaction(pred_time_online$stim_type, pred_time_online$task, drop = TRUE)
+
+(RT_reading_stimtype_task_time_online <- ggplot(pred_time_online, aes(x = time_from_onset_task, y = estimate, colour = stim_task, fill = stim_task)) +
+  #geom_jitter2(data = slice_sample(subset(reading_df, is_trigger == "True"), prop = 0.3), mapping = aes(x = surprisal_2, y = RT), alpha = 0.02) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 1.1) +
+  facet_wrap(~ task, labeller = labeller(task = c("Reading" = "Reading", "2-back dual" = "Dual task")), scales = "free_x") +
+  ylab("Reading time in ms") +
+  xlab("Time since task onset in s") +
+  scale_x_continuous(breaks = breaks_extended(n = 3)) +
+  #coord_cartesian(ylim = c(400, 1250)) +
+  scale_y_continuous(breaks = breaks_extended(n = 3)) +
+  scale_color_manual(values = cols_reading[c(1, 3, 4, 6)]) +
+  scale_fill_manual(values = cols_reading[c(1, 3, 4, 6)]) +
+  theme_bw(base_size = 9.5)+
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_text(size = 10),
+       axis.text.x = element_text(size = 8.5, angle = 45, hjust = 1, vjust = 1))
+)
+ggsave(RT_reading_stimtype_task_surprisal_online, file = here(paste0("Plots/RT_reading_stimtype_task_surprisal_online_", today, ".pdf")), width = 60, height = 60, units = "mm")
+
+### calculate difference smooths ----
+cmp_reading_time_online <- comparisons(
+  gamm_reading_online,
+  newdata = reading_grid_time_online,
+  variables = list(stim_type = "pairwise"),
+  type = "link",
+  transform = exp,
+  exclude = rand_terms,
+  #cross = TRUE
+  comparison = "difference"
+  #hypothesis = stim_type * task
+)
+
+# with transform = exp we get ratio, otherwise we get log ms
+# interpretation: 
+# ratio of 0.9999152 means: for one unit of surprisal, RT is 0.0000848% lower relative to sham, multiply this e.g. by 1000 s to get a better picture: 0.0848 --> after 1000s about 8.5% lower than sham
+
+cmp_df_reading_time_online <- as.data.frame(cmp_reading_time_online)
+cmp_df_reading_time_online$comp_task <- interaction(cmp_df_reading_time_online$contrast, cmp_df_reading_time_online$task)
+cmp_df_reading_time_online$percent_change_rt <- (cmp_df_reading_time_online$estimate - 1)*100
+cmp_df_reading_time_online <- cmp_df_reading_time_online %>% 
+  mutate(significance = case_when(p.value < 0.05 ~ "significant",
+                                  TRUE ~ "not significant"),
+         significance_ribbon = case_when(p.value < 0.05 ~ "significant",
+                                  TRUE ~ "not significant"),
+         significance_line = case_when(p.value < 0.05 ~ "significant",
+                                  TRUE ~ "not significant"))
+
+cmp_df_reading_time_online <- cmp_df_reading_time_online %>% 
+  arrange(task, comp_task, time_from_onset_task) %>% 
+  group_by(task, comp_task) %>% 
+  mutate(seg_id = cumsum(significance != dplyr::lag(significance, default = first(significance)))) %>% 
+  ungroup()
+
+(RT_comp_reading_stimtype_task_time_online <- ggplot(cmp_df_reading_time_online, aes(x = time_from_onset_task, y = percent_change_rt, colour = comp_task, fill = comp_task, group = interaction(comp_task, seg_id))) +
+  #geom_rect(data = sig_ranges, aes(xmin = x_start, xmax = x_end, ymin = -Inf, ymax = Inf), inherit.aes = FALSE, fill  = "grey80", alpha = 0.25) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#3b4856", linewidth = 0.8, alpha = 0.7) +
+  geom_ribbon(aes(ymin = (conf.low-1)*100, ymax = (conf.high-1)*100, alpha = significance_ribbon), colour = NA) +
+  scale_alpha_manual(values = c("not significant" = 0.1, "significant" = 0.3), name = "ribbon") +
+  new_scale("alpha") +
+  geom_line(linewidth = 1.5, aes(alpha = significance_line)) + #aes(linetype = significance)
+  scale_alpha_manual(values = c("not significant" = 0.3, "significant" = 1), name = "line") +
+  #geom_vline(data = sig_ranges, aes(xintercept = x_start), linetype = 2, colour = "black") +
+  #geom_vline(data = sig_ranges, aes(xintercept = x_end), linetype = 2, colour = "black") +
+  facet_wrap(~ task, labeller = labeller(task = c("Reading" = "Reading", "2-back dual" = "Dual task")), scales = "free_x") +
+  ylab("% change in RT") +
+  xlab("Time since task onset in s") +
+  #coord_cartesian(ylim = c(400, 1600)) +
+  scale_x_continuous(breaks = breaks_extended(n = 3)) +
+  scale_y_continuous(breaks = breaks_extended(n = 3)) +
+  scale_color_manual(values = cols_reading[c(3,6)]) +
+  scale_fill_manual(values = cols_reading[c(3,6)]) +
+  #scale_linetype_manual(values = c(1,3)) +
+  theme_bw(base_size = 9.5)+
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       #axis.title.x = element_blank(),
+       axis.text.x.bottom = element_text(size = 8.5, angle = 45, hjust = 1, vjust = 1))
+)
+
+# old 
+pr <- predict_response(gamm_reading_online, c("surprisal_2", "stim_type", "task"), back_transform = )
+df_pred <- pr %>%
+  as.data.frame() %>% 
+  rename(
+    stim_type   = group,        
+    task        = facet,   
+    surprisal_2 = x    
+  ) %>%
+  select(stim_type, task, surprisal_2,
+         predicted, conf.low, conf.high)
+df_wide <- df_pred %>%
+  pivot_wider(
+    names_from = c(stim_type, task),
+    values_from = c(predicted, conf.low, conf.high)
+  )
+df_interact <- df_wide %>%
+  mutate(
+    `ratio_Offline + Online_Sham_Reading` = `predicted_Offline + Online_Reading` / predicted_Sham_Reading,
+    `ratio_Offline + Online_Sham_2-back dual` = `predicted_Offline + Online_2-back dual` / `predicted_Sham_2-back dual`,
+    interaction_ratio = `ratio_Offline + Online_Sham_2-back dual` / `ratio_Offline + Online_Sham_Reading`,
+    percent_change_interaction = (interaction_ratio - 1) * 100
+  )
+ggplot(df_interact,
+       aes(x = surprisal_2,
+           y = percent_change_interaction)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_line(linewidth = 1.2) +
+  ylab("% change (interaction A vs B, X vs Y)") +
+  xlab("Lexical surprisal") +
+  theme_bw()
+
+
+# LMM plots ----
+##1) Parametric effects Online Trials LMM ----
+pred_lmm_online <- predictions(
+  lmm_reading_online,
+  by = c("stim_type", "task"),
+  type = "response",
+  transform = exp,
+  re.form = NA
+)
+pred_lmm_online$stim_task <- interaction(pred_lmm_online$stim_type, pred_lmm_online$task, drop = TRUE)
+
+stim_task_labels <- c(
+  "Sham.Reading" = "Sham",
+  "Offline + Online.Reading" = "Active",
+  "Sham.2-back dual" = "Sham",
+  "Offline + Online.2-back dual" = "Active"
+)
+
+(LMM_RT_reading_stim_type_task_online <- ggplot(pred_lmm_online, aes(x = stim_task, y = estimate, color = stim_task, group = stim_task, fill = stim_task)) +
+  #geom_point(data = reading_df, mapping = aes(x = task, y = RT, color = stim_task), alpha = 1, position=position_jitterdodge()) +
+  geom_point(position = position_dodge(width = 1), size = 3, shape = 23) +
+  geom_errorbar(mapping = aes(ymin = conf.low, ymax = conf.high), width = 0.15, position = position_dodge(width = 1), linewidth = 1) +
+  ylab("Reading time in ms") +
+  xlab("Task") +
+  scale_y_continuous(limits = c(300, 1100)) +
+  #scale_x_discrete(labels = c("Reading", "Dual task")) +
+  scale_x_discrete(labels = stim_task_labels) +
+  #coord_cartesian(ylim = c(380, 950)) +
+  scale_color_manual(values = cols_reading[c(1,3,4,6)]) +
+  scale_fill_manual(values = cols_reading[c(1,3,4,6)]) +
+  theme_bw(base_size = 9.5) +
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       #strip.text = element_blank(),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       axis.title.x = element_blank(),
+       axis.text.x = element_text(size = 8.5, angle = 45, vjust = 1, hjust = 1))
+)
+ggsave(LMM_RT_reading_stim_type_task_online, file = here(paste0("Plots/LMM_RT_reading_stim_type_task_online_", today, ".pdf")), width = 50, height = 57, units = "mm")
+
+
+
+##4f) Online TMS plot ----
+(figure_RT_reading_online <- ggarrange(RT_reading_stimtype_task_time_online +
+                                          theme(axis.title.x = element_blank()),
+                                RT_comp_reading_stimtype_task_time_online +
+                                  theme(axis.title.x = element_blank()),
+                                nrow = 1)
+  
+)
+ggsave(figure_RT_reading_online, file = here(paste0("Plots/figure_RT_reading_online_", today, ".pdf")), width = 120, height = 60, units = "mm")
+
+
+# old stuff but maybe useful ----
+pred_gamm_reading_RT_stimType_task_surprisal <- estimate_slopes(gamm_reading, by = c("stim_type", "task"), trend = "surprisal_2", transform = TRUE, backend = "marginalmeans", include_random = TRUE)
+
+plot(pred_gamm_reading_RT_stimType_task_surprisal)
+
+#pred_gamm_nback_RT_stimType_task2 <- avg_predictions(gamm_RT_only_nback, variables = c("task", "stim_type"), type = "response", transform = exp)
+#plot_predictions(gamm_RT_only_nback, condition = c("stim_type", "task"), type = "response", transform = exp)
+
+# plot the predicted values
+(plot_gamm_nback_RT_stimType_task <- ggplot(pred_gamm_reading_RT_stimType_task_surprisal, aes(x = stim_type, y = Slope, color = task, fill = task)) +
+   geom_point2(size = 3, position = position_dodge(width = 0.5)) +
+   geom_errorbar(aes(ymin = CI_low, ymax = CI_high), width = 0.2, position = position_dodge(width = 0.5)) +
+   geom_line(aes(group = task), position = position_dodge(width = 0.5), alpha = 0.75, linetype = "dashed") +
+   #geom_violinhalf(data = nback_only_nback_trials, aes(x = task, y = RT), position = position_dodge(width = 0.4), trim = T) +
+   ylab("N-back reaction time in ms") +
+   xlab("Stimulation condition") +
+   #coord_cartesian(ylim=c(800, 1100)) +
+   scale_color_manual(values = cols_nback) +  
+   scale_fill_manual(values = cols_nback) +  
+   theme_bw() +
+   theme(legend.position = "bottom",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         strip.background = element_blank(),
+         axis.line = element_line(),
+         #axis.title.y = element_text(size = 8),
+         axis.text.y = element_text(size = 10),
+         axis.text.x = element_text(size = 10))
+         #axis.title = element_blank())
+)
+
+ggsave(plot_gamm_nback_RT_stimType_task, file = here::here("Plots/plot_gamm_nback_RT_stimType_task.rds"))
+
+estimate_contrasts(gamm_reading, contrast = c("stim_type"), by = c("task"), transform = TRUE, p_adjust = "fdr", comparison = "reference", integer_as_continuous = TRUE, backend = "marginalmeans")
+
+### Compare time slopes ----
+slopes_gamm_nback_RT_stimType_time <- estimate_slopes(gamm_RT_only_nback, 
+                                                      by = c("stim_type"), 
+                                                      trend = "time_from_onset_session", 
+                                                      transform = TRUE, # with transform = TRUE we get ratio, otherwise we get log ms
+                                                      hypothesis = difference ~ reference, # gives us the difference in slope
+                                                      multcomp = "holm") 
+# interpretation: 
+# ratio of 0.9999152 means: for one s RT is 0.0000848% lower relative to sham, multiply this e.g. by 1000 s to get a better picture: 0.0848 --> after 1000s about 8.5% lower than sham
+
+# alternative that works equally well:
+#estimate_contrasts(gamm_RT_only_nback, contrast = c("time_from_onset_session"), by = c("stim_type"), p_adjust = "fdr", comparison = "pairwise", integer_as_continuous = TRUE, backend = "emmeans", predict = "response", transform = T)
+
+slopes_gamm_nback_RT_stimType_time
+plot(slopes_gamm_nback_RT_stimType_time)
+
+```
+
+## Check specificity of surprisal vs other lexical predictors
+```{r}
+reading_df <- reading_df %>% 
+  mutate(across(where(is.character), as.factor))
+
+# ORIGINAL GAMM (SURPRISAL) ----
+gamm_reading_orig <- bam(log(RT) ~ 
+            # parametric main effects and interactions (factors)  
+              #stim_type + 
+              #task +
+              session + 
+              is_trigger + 
+              reaction +
+              punctuation +
+              RS +
+              executive_sum +
+              education_years +
+              Age +
+              sideEffects_sum +
+              #stim_type:task + 
+            # non-parametric main effects (smooths)
+              s(time_from_onset_task, k = 20) + 
+              s(surprisal_2, k = 20) + 
+              s(entropy_2, k = 30) +
+              s(word_length_single, k = 20) + 
+              s(zipf_frequency, k = 20) +
+              s(log(previous_duration), k = 50) +
+              s(previous_surprisal_2, k = 20) + 
+            # interactions
+              s(stim_type, time_from_onset_task, bs = "sz", k = 20) + 
+              s(task, time_from_onset_task, bs = "sz", k = 20) + 
+              s(stim_type, task, time_from_onset_task, bs = "sz", k = 20) + 
+              #s(time_from_onset_task, by = stimType_task, k = 20) + # old way of writing the interaction term
+              
+              s(stim_type, surprisal_2, bs = "sz", k = 20) + 
+              s(task, surprisal_2, bs = "sz", k = 20) + 
+              s(stim_type, task, surprisal_2, bs = "sz", k = 20) + 
+              #s(surprisal_2, by = stimType_task, k = 20) + # old way of writing the interaction term
+            # random terms
+              s(participant, bs = "re") +
+              s(participant, stim_type, bs = "re") +
+              s(participant, task, bs = "re") +  
+              #s(surprisal_2, participant, bs = "fs", k = 10) +
+              s(time_from_onset_task, participant, bs = "fs") +
+              s(text_nr, bs = "re"),
+    data = reading_df,
+    #family = Gamma(link = "log"),
+    method = "fREML",
+    discrete = TRUE,
+    control = gam.control(nthreads = n.cores)
+)
+
+gam.check(gamm_reading_orig, k.rep = 1000)
+
+summary(gamm_reading_orig)
+
+# ENTROPY ----
+gamm_entropy <- bam(log(RT) ~ 
+            # parametric main effects and interactions (factors)  
+              #stim_type + 
+              #task +
+              session + 
+              is_trigger + 
+              reaction +
+              punctuation +
+              RS +
+              executive_sum +
+              education_years +
+              Age +
+              sideEffects_sum +
+              #stim_type:task + 
+            # non-parametric main effects (smooths)
+              s(time_from_onset_task, k = 20) + 
+              s(surprisal_2, k = 20) + 
+              s(entropy_2, k = 30) +
+              s(word_length_single, k = 20) + 
+              s(zipf_frequency, k = 20) +
+              s(log(previous_duration), k = 50) +
+              s(previous_surprisal_2, k = 20) + 
+            # interactions
+              s(stim_type, time_from_onset_task, bs = "sz", k = 20) + 
+              s(task, time_from_onset_task, bs = "sz", k = 20) + 
+              s(stim_type, task, time_from_onset_task, bs = "sz", k = 20) + 
+              #s(time_from_onset_task, by = stimType_task, k = 20) + # old way of writing the interaction term
+              
+              s(stim_type, entropy_2, bs = "sz", k = 20) + 
+              s(task, entropy_2, bs = "sz", k = 20) + 
+              s(stim_type, task, entropy_2, bs = "sz", k = 20) + 
+              #s(surprisal_2, by = stimType_task, k = 20) + # old way of writing the interaction term
+            # random terms
+              s(participant, bs = "re") +
+              s(participant, stim_type, bs = "re") +
+              s(participant, task, bs = "re") +  
+              #s(surprisal_2, participant, bs = "fs", k = 10) +
+              s(time_from_onset_task, participant, bs = "fs") +
+              s(text_nr, bs = "re"),
+    data = reading_df,
+    #family = Gamma(link = "log"),
+    method = "fREML",
+    discrete = TRUE,
+    control = gam.control(nthreads = n.cores)
+)
+
+gam.check(gamm_entropy, k.rep = 1000)
+
+summary(gamm_entropy)
+
+# Surprisal vs Entropy ----
+compare_performance(gamm_reading_orig, gamm_entropy, rank = TRUE)
+
+AIC(gamm_reading_orig, gamm_entropy) # surprisal model performs better
+
+# WORD LENGTH ----
+gamm_word_length <- bam(log(RT) ~ 
+            # parametric main effects and interactions (factors)  
+              #stim_type + 
+              #task +
+              session + 
+              is_trigger + 
+              reaction +
+              punctuation +
+              RS +
+              executive_sum +
+              education_years +
+              Age +
+              sideEffects_sum +
+              #stim_type:task + 
+            # non-parametric main effects (smooths)
+              s(time_from_onset_task, k = 20) + # we don't need this because of its interaction with the unordered factor for stim_type
+              s(surprisal_2, k = 20) + # we don't need this because of its interaction with the unordered factor for stim_type
+              s(entropy_2, k = 30) +
+              s(word_length_single, k = 20) + 
+              s(zipf_frequency, k = 20) +
+              s(log(previous_duration), k = 35) +
+              s(previous_surprisal_2, k = 20) + 
+            # interactions
+              s(stim_type, time_from_onset_task, bs = "sz", k = 20) + 
+              s(task, time_from_onset_task, bs = "sz", k = 20) + 
+              s(stim_type, task, time_from_onset_task, bs = "sz", k = 20) + 
+              #s(time_from_onset_task, by = stimType_task, k = 20) +
+              
+              s(stim_type, word_length_single, bs = "sz", k = 20) + 
+              s(task, word_length_single, bs = "sz", k = 20) + 
+              s(stim_type, task, word_length_single, bs = "sz", k = 20) + 
+              #s(surprisal_2, by = stimType_task, k = 20) + 
+            # random terms
+              s(participant, bs = "re") +
+              s(participant, stim_type, bs = "re") +
+              s(participant, task, bs = "re") +  
+              #s(word_length_single, participant, bs = "fs", k = 10) +
+              s(time_from_onset_task, participant, bs = "fs") +
+              s(text_nr, bs = "re"),
+    data = reading_df,
+    #family = Gamma(link = "log"),
+    method = "fREML",
+    discrete = TRUE,
+    control = gam.control(nthreads = n.cores)
+)
+
+gam.check(gamm_word_length, k.rep = 1000)
+
+summary(gamm_word_length)
+
+
+# FREQUENCY ----
+gamm_frequency <- bam(log(RT) ~ 
+            # parametric main effects and interactions (factors)  
+              #stim_type + 
+              #task +
+              session + 
+              is_trigger + 
+              reaction +
+              punctuation +
+              RS +
+              executive_sum +
+              education_years +
+              Age +
+              sideEffects_sum +
+              #stim_type:task + 
+            # non-parametric main effects (smooths)
+              s(time_from_onset_task, k = 20) + # we don't need this because of its interaction with the unordered factor for stim_type
+              s(surprisal_2, k = 20) + # we don't need this because of its interaction with the unordered factor for stim_type
+              s(entropy_2, k = 30) +
+              s(word_length_single, k = 20) + 
+              s(zipf_frequency, k = 20) +
+              s(log(previous_duration), k = 35) +
+              s(previous_surprisal_2, k = 20) + 
+            # interactions
+              s(stim_type, time_from_onset_task, bs = "sz", k = 20) + 
+              s(task, time_from_onset_task, bs = "sz", k = 20) + 
+              s(stim_type, task, time_from_onset_task, bs = "sz", k = 20) + 
+              #s(time_from_onset_task, by = stimType_task, k = 20) +
+              
+              s(stim_type, zipf_frequency, bs = "sz", k = 20) + 
+              s(task, zipf_frequency, bs = "sz", k = 20) + 
+              s(stim_type, task, zipf_frequency, bs = "sz", k = 20) + 
+              #s(surprisal_2, by = stimType_task, k = 20) + 
+            # random terms
+              s(participant, bs = "re") +
+              s(participant, stim_type, bs = "re") +
+              s(participant, task, bs = "re") +  
+              #s(zipf_frequency, participant, bs = "fs", k = 10) +
+              s(time_from_onset_task, participant, bs = "fs") +
+              s(text_nr, bs = "re"),
+    data = reading_df,
+    #family = Gamma(link = "log"),
+    method = "fREML",
+    discrete = TRUE,
+    control = gam.control(nthreads = n.cores)
+)
+
+gam.check(gamm_frequency, k.rep = 1000)
+
+summary(gamm_frequency)
+
+
+# MODEL COMPARISON
+compare_performance(gamm_reading_orig, 
+                    gamm_entropy,
+                    gamm_frequency,
+                    gamm_word_length, 
+                    rank = TRUE)
+
+AIC(gamm_reading_orig, gamm_entropy, gamm_frequency, gamm_word_length)
+```
+
+
+## Comprehension question accuracy
+```{r}
+# Question-wise analysis ----
+df_comprehension_Qs <- readRDS(here::here("RData/df_comprehension_questions.rds"))
+
+df_comprehension_Qs$participant <- str_pad(df_comprehension_Qs$participant, width = 2, side = "left", pad = "0")
+reading_subset <- reading_df %>% 
+  select(participant, stim_type, session, task, block_nr_exp, text_nr, education_years, Age, RS, executive_sum, sideEffects_sum) %>% 
+  distinct()
+df_comprehension_Qs <- full_join(reading_subset, df_comprehension_Qs)
+df_comprehension_Qs$ans_correct <- as.factor(df_comprehension_Qs$ans_correct)
+df_comprehension_Qs <- df_comprehension_Qs %>% 
+  filter(!is.na(stim_type)) # exclude blocks from participants also excluded from the main analysis
+df_comprehension_Qs$stim_task <- interaction(df_comprehension_Qs$stim_type, df_comprehension_Qs$task)
+
+glmer_question_acc <- glmmTMB(ans_correct ~ 
+    stim_type +
+    task +
+    session +
+    scale(block_nr_exp, scale = FALSE) +
+    scale(education_years, scale = FALSE) +
+    scale(Age, scale = FALSE) +
+    scale(executive_sum, scale = FALSE) +
+    scale(RS, scale = FALSE) +
+    scale(sideEffects_sum, scale = FALSE) +
+    stim_type:task +
+    (1 + stim_type + task || participant) +
+    (1 | text_nr),
+  data = df_comprehension_Qs, 
+  family = binomial(link = "logit"),
+)
+
+summary(glmer_question_acc)
+Anova(glmer_question_acc, type = 3)
+
+pred_glmm_questions <- predict_response(glmer_question_acc, c("stim_type", "task"), margin = "marginalmeans", bias_correction = TRUE)
+
+pred_glmm_questions <- pred_glmm_questions %>% 
+  mutate(
+    stim_type = x,
+    task = group,
+    stim_task = interaction(stim_type, task)
+  ) %>% 
+  filter(!is.na(x))
+
+(GLMM_questions_stim_type_task <- ggplot(pred_glmm_questions, aes(x = x, y = predicted*100, color = stim_task, fill = stim_task)) +
+  geom_jitter(data = df_comprehension_Qs, mapping = aes(x = stim_type, y = question_acc*100, color = stim_task), alpha = 0.05, position = position_jitterdodge(dodge.width = 1, jitter.width = 0.5)) +
+  geom_point(size = 3.5, shape = 23) +
+  geom_errorbar(mapping = aes(ymin = conf.low*100, ymax = conf.high*100), width = 0.15, linewidth = 1) +
+  ylab("Question accuracy in %") +
+  xlab("Task") +
+  #scale_y_continuous(limits = c(400, 1290)) +
+  #scale_y_continuous(limits = c(450, 1100)) +
+  #scale_x_discrete(labels = c("Reading", "Dual task")) +
+  #coord_cartesian(ylim = c(400, 1600)) +
+  scale_color_manual(values = cols_reading) +
+  scale_fill_manual(values = cols_reading) +
+  facet_wrap(~ task, scales = "free_x", labeller = labeller(task = c("Reading" = "Reading", "2-back dual" = "Dual task"))) +
+  theme_bw(base_size = 9.5)+
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       axis.title.x = element_blank(),
+       axis.text.x = element_text(size = 8.5, angle = 45, hjust = 1, vjust = 1))
+)
+ggsave(GLMM_questions_stim_type_task, file = here(paste0("Plots/GLMM_questions_stim_type_task_", today, ".pdf")), width = 60, height = 65, units = "mm")
+
+# tab model together for question accuracy and d-prime
+tab_model(glmer_question_acc,
+          lmm_nback_dprime,
+  show.intercept = FALSE,
+  show.icc = TRUE,   # ICC (Intraclass Correlation) is not always needed
+  show.re.var = TRUE,  # Show variance of random effects
+  show.df = FALSE,     # Don't display degrees of freedom
+  show.obs = TRUE,    # Don't display number of observations
+  show.ngroups = FALSE, # Don't display number of groups for random effects
+  show.stat = TRUE,    # Show model statistics (e.g., p-values, F-values)
+  collapse.ci = TRUE,  # Collapse confidence intervals into one line
+  show.std = "std", # Show standardized beta,
+  df.method = "satterthwaite",
+  dv.labels = c("´Question accuracy", "D-prime"),
+  file = here("Model_tables/accuracy_models.doc")
+)
+
+# Old: analysis of % correct (doesn't matter though, no TMS effects) ----
+quest_acc_df <- reading_df %>% 
+  select(participant, stim_type, task, session, cognitive_load, question_acc, sideEffects_sum, block_nr_exp, RS, executive_sum, education_years, Age, task_onset, text_nr) %>% 
+  distinct()
+
+ggplot(quest_acc_df, aes(x = stim_type, y = question_acc*100)) +
+  geom_boxplot()
+
+## GAMM ----
+quest_acc_df <- quest_acc_df %>% 
+  ungroup() %>% 
+  mutate(across(where(is.character), as.factor))
+
+gamm_quest_acc <- bam(question_acc ~
+                         stim_type +
+                         session +
+                         task +
+                         s(block_nr_exp, k = 10) + 
+                         RS +
+                         executive_sum +
+                         education_years +
+                         Age +
+                         sideEffects_sum +
+                         stim_type:task +
+                         s(participant, bs = "re") +
+                         s(participant, by = stim_type, bs = "re") +
+                         s(participant, by = task, bs = "re") +
+                         s(text_nr, bs = "re"),
+              data = quest_acc_df,
+              method = "fREML",
+              discrete = TRUE,
+              control = gam.control(nthreads = n.cores),
+)
+
+k.check(gamm_quest_acc, n.rep = 1000)
+
+summary(gamm_quest_acc)
+
+## LMM on percent accuracy ----
+reading_quest_acc <- lmerTest::lmer(question_acc ~
+    stim_type +
+    session +
+    task +
+    stim_type:task +
+    scale(block_nr_exp, scale = FALSE) +
+    scale(education_years, scale = FALSE) +
+    scale(Age, scale = FALSE) +
+    scale(executive_sum, scale = FALSE) +
+    scale(RS, scale = FALSE) +
+    scale(sideEffects_sum, scale = FALSE) +
+    (1 | participant) +
+    (1 | text_nr),
+  data = quest_acc_df, 
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa")
+)
+
+summary(reading_quest_acc)
+```
+
+## Raw Data Plots
+### Plot RTs
+```{r plot single n-back tasks}
+reading_df <- subset(reading_df, !is.na(surprisal_2))
+reading_df <- subset(reading_df, surprisal_2 < 40)
+reading_df <- reading_df %>% 
+  mutate(task = dplyr::recode(task, "Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "2-back dual"))
+
+# Summary df by condition
+reading_df_summary <- reading_df %>% 
+  group_by(stim_type, task) %>%
+  summarise(mean_rt = mean(RT),
+            SD_rt = sd(RT),
+            std.error_rt = std.error(RT)) %>% 
+  mutate(task = factor(task, levels = c("Reading", "2-back dual")),
+         stim_type = factor(stim_type, levels = c("Sham", "Offline", "Offline + Online")))
+#reading_df_summary$stim_task <- interaction(reading_df_summary$stim_type, reading_df_summary$task, drop = TRUE)
+
+RT_reading_part <- reading_df %>% 
+  group_by(participant, stim_type, task) %>% 
+  summarise(mean_rt = mean(RT)) %>% 
+  mutate(task = factor(task, levels = c("Reading", "2-back dual")),
+         stim_type = factor(stim_type, levels = c("Sham", "Offline", "Offline + Online")))
+RT_reading_part$stim_task <- interaction(RT_reading_part$stim_type, RT_reading_part$task, drop = TRUE)
+
+#1) Boxplot of RTs by Task and Stimulation ----
+(RT_reading_raw_boxplot <- ggplot(reading_df_summary, aes(x = stim_type, y = mean_rt, group = task)) +
+    #geom_bar(aes(), stat = "identity", width = 0.5) +
+    #geom_errorbar(aes(ymin = mean_rt - std.error_rt, ymax = mean_rt + std.error_rt), width =0.07, linewidth=0.7) +
+    geom_boxplot(RT_reading_part, mapping = aes(x = stim_type, y = mean_rt, fill = stim_task, group = stim_task)) +
+    geom_point2(shape = 18, size = 2, position = position_dodge(width = 0.75)) +
+    geom_line(aes(x = stim_type, y = mean_rt, group = 1), color="black", linetype="dotted", position = position_dodge(width = 0.75))+
+    scale_fill_manual(values = cols_reading) +
+    scale_color_manual(values = cols_reading) +
+    #scale_y_continuous(limits = c(250, 1290), breaks = c(400, 800, 1200)) +
+    scale_x_discrete(labels = c(rep(c("Sham", "Offline", "Offline+Online"), 2))) +
+    coord_cartesian(ylim = c(250, 1550)) +
+    facet_grid(~ task, scales = "free_x", space = "free_x") +
+    ylab("Reading Time in ms") +
+    xlab("Task") +
+    theme_bw(base_size = 9.5)+
+    theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       axis.title.x = element_blank(),
+       axis.text.x = element_text(size = 8.5, angle = 45, vjust = 1, hjust = 1)) 
+)
+
+#2) Violin plot with individual participant lines
+(RT_reading_raw_violin <- ggplot(RT_reading_part, aes(x = stim_type, y = mean_rt, group = task)) +
+  geom_violinhalf(data = RT_reading_part, mapping = aes(fill = stim_task, group = stim_task), alpha = 1, color = NA, trim = TRUE, flip = FALSE, position = position_nudge(x =  0.15)) +
+  geom_point2(position = position_jitter(width = 0.1, seed = 42), size = 1.5, alpha = .35) +
+  geom_line(mapping = aes(group = participant), color = "#878787", linewidth = 0.2, alpha = 0.55, position = position_jitter(width = 0.1, seed = 42)) +
+  facet_grid(~ task, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = cols_reading) +
+  scale_color_manual(values = cols_reading) +
+  scale_x_discrete(expand = expansion(mult = c(0.1, 0.35)), labels = c(rep(c("Sham", "Offline", "Offline+Online"), 2))) +
+  coord_cartesian(ylim = c(250, 1550)) +
+  ylab("Reading Time in ms") +
+  theme_bw(base_size = 9.5) +
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       axis.title.x = element_blank(),
+       axis.text.x = element_text(size = 8.5, angle = 45, vjust = 1, hjust = 1))
+)
+
+## arrange plots ----
+RT_reading_raw <- ggarrange(RT_reading_raw_boxplot,
+            RT_reading_raw_violin +
+              theme(axis.title.y = element_blank(),
+                    axis.text.y = element_blank(),
+                    axis.ticks.y = element_blank(),
+                    axis.line.y = element_blank()),
+            nrow = 1)
+            #heights = c(1,1))
+            #widths = c(0.7,0.55),
+
+ggsave(RT_reading_raw, file = here::here(paste0("Plots/RT_reading_raw_", today, ".pdf")), width = 130, height = 70, units = "mm")
+
+#3) Plot RT across time from task onset by stim_type ----
+RT_reading_part <- reading_df %>% 
+  group_by(participant, stim_type, task) %>% 
+  summarise(mean_rt = mean(RT))
+
+RT_reading_part$stim_task <- interaction(RT_reading_part$stim_type, RT_reading_part$task, drop = TRUE)
+(RT_raw_time <- ggplot(reading_df, aes(x = time_from_onset_task, y = RT, fill = stim_type, color = stim_type)) +
+    #geom_boxplot(RT_nback_part, mapping = aes(x = task, y = mean_rt, fill = stim_type)) +
+    #geom_point2(size = 1, alpha = 0.05) +
+    geom_smooth(method = "loess") +
+    #geom_line(aes(x = task, y = mean_rt, group = stim_type), color="black", linetype="dotted", position = position_dodge(width = 0.75))+
+    #geom_violinhalf(RT_nback_part, mapping = aes(x = task, y = mean_rt, fill = stim_type)) +
+    scale_fill_manual(values = cols_reading) +
+    scale_color_manual(values = cols_reading) +
+    facet_wrap(~ task, scales = "free_x") +
+    #scale_y_continuous(breaks = c(1000, 2000, 3000, 4000, 5000, 6000)) +
+    coord_cartesian(ylim = c(300, 1500)) +
+    ylab("Reading Time in ms") +
+    xlab("Time from Session Onset in s") +
+    theme_bw()+
+    theme(legend.position = "bottom",
+         text = element_text(family = "Helvetica"),
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor = element_blank(),
+         axis.line = element_line(),
+         axis.text.y = element_text(size = 10),
+         #axis.title.x = element_blank(),
+         axis.text.x.bottom = element_text(size = 9.5)) 
+    #facet_wrap(~ block_name, nrow = 2)
+)
+
+ggsave(RT_single_nback_raw, file = here::here(paste0("Plots/RT_single_nback_raw_", today, ".png")), width = 210, height = 100, units = "mm")
+
+#4) Plot RT across surprisal ----
+(RT_reading_raw_surprisal <- ggplot(slice_sample(reading_df, prop = 0.1), aes(x = surprisal_2, y = RT)) +
+    geom_point2(size = 1, alpha = 0.04) +
+    geom_smooth(method = "loess", color = "darkslategrey") +
+    facet_wrap(~ task, labeller = labeller(task = as_labeller(c("Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "Dual task")))) +
+    scale_y_continuous(limits = c(250, 1290), breaks = c(400, 800, 1200)) +
+    #coord_cartesian(ylim = c(250, 1290)) +
+    ylab("Reading time in ms") +
+    xlab("Lexical surprisal") +
+    theme_bw(base_size = 9.5)+
+    theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       axis.title.x = element_blank(),
+       axis.text.x = element_text(size = 8.5))
+)
+
+ggsave(RT_reading_raw_surprisal, file = here::here(paste0("Plots/RT_reading_raw_surprisal.pdf")), width = 70, height = 60, units = "mm")
+
+# Plot online trials only ----
+RT_reading_online <- reading_df_online %>% 
+  group_by(stim_type, task) %>%
+  summarise(mean_rt = mean(RT),
+            SD_rt = sd(RT),
+            std.error_rt = std.error(RT))
+
+RT_reading_online_part <- reading_df_online %>% 
+  group_by(participant, stim_type, task) %>% 
+  summarise(mean_rt = mean(RT))
+RT_reading_online_part$stim_task <- interaction(RT_reading_online_part$stim_type, RT_reading_online_part$task)
+
+##1) Boxplot of RTs by Task and Stimulation ----
+(RT_reading_raw_online_boxplot <- ggplot(RT_reading_online, aes(x = stim_type, y = mean_rt, group = task)) +
+    #geom_bar(aes(), stat = "identity", width = 0.5) +
+    #geom_errorbar(aes(ymin = mean_rt - std.error_rt, ymax = mean_rt + std.error_rt), width =0.07, linewidth=0.7) +
+    geom_boxplot(RT_reading_online_part, mapping = aes(x = stim_type, y = mean_rt, fill = stim_task, group = stim_task)) +
+    geom_point2(shape = 18, size = 2, position = position_dodge(width = 0.75)) +
+    geom_line(aes(x = stim_type, y = mean_rt, group = 1), color = "black", linetype = "dotted", position = position_dodge(width = 0.75))+
+    scale_fill_manual(values = cols_reading[c(1,3,4,6,7,9)]) +
+    scale_color_manual(values = cols_reading[c(1,3,4,6,7,9)]) +
+    #scale_y_continuous(limits = c(350, 1200), breaks = c(400, 800, 1200)) +
+    scale_x_discrete(labels = c(rep(c("Sham", "Active"), 2))) +
+    #coord_cartesian(ylim = c(400, 1600)) +
+    facet_grid(~ task) +
+    ylab("Reaction time in ms") +
+    xlab("Task") +
+    theme_bw(base_size = 9.5)+
+    theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       axis.title.x = element_blank(),
+       axis.text.x = element_text(size = 8.5, angle = 45, vjust = 1, hjust = 1)) 
+)
+
+#2) Violin plot with individual participant lines
+(RT_reading_raw_online_violin <- ggplot(RT_reading_online_part, aes(x = stim_type, y = mean_rt, group = task)) +
+  geom_violinhalf(data = RT_reading_online_part, mapping = aes(fill = stim_task, group = stim_task), alpha = 1, color = NA, trim = TRUE, flip = FALSE, position = position_nudge(x =  0.15)) +
+  geom_point2(position = position_jitter(width = 0.1, seed = 42), size = 1.5, alpha = .35) +
+  geom_line(mapping = aes(group = participant), color = "#878787", linewidth = 0.2, alpha = 0.55, position = position_jitter(width = 0.1, seed = 42)) +
+  facet_grid(~ task) +
+  scale_fill_manual(values = cols_reading[c(1,3,4,6)]) +
+  scale_color_manual(values = cols_nback[c(1,3,4,6)]) +
+  scale_x_discrete(expand = expansion(mult = c(0.2, 0.65)), labels = c(rep(c("Sham", "Active"), 2))) +
+  #scale_y_continuous(limits = c(350, 1200), breaks = c(400, 800, 1200)) +
+  ylab("Reaction time in ms") +
+  theme_bw(base_size = 9.5) +
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 10),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8.5),
+       axis.title.x = element_blank(),
+       axis.text.x = element_text(size = 8.5, angle = 45, vjust = 1, hjust = 1)) #angle = 45, vjust = 1, hjust = 1
+)
+
+## arrange plots ----
+RT_reading_online_raw <- ggarrange(RT_reading_raw_online_boxplot,
+            RT_reading_raw_online_violin +
+              theme(axis.title.y = element_blank(),
+                    axis.text.y = element_blank(),
+                    axis.ticks.y = element_blank(),
+                    axis.line.y = element_blank()),
+            nrow = 1)
+            #heights = c(1,1))
+            #widths = c(0.7,0.55),
+
+
+ggsave(RT_reading_online_raw, file = here::here(paste0("Plots/RT_reading_raw_online_", today, ".pdf")), width = 120, height = 62, units = "mm")
+```
+
+## E-FIELDS
+### Correlations with raw data
+```{r efields prepare df}
+# Read in file with e-fields (95 percentile from 10 mm ROI around stim coordinates) and prepare df
+df_efields = read.table(here::here("average_efields_sphere_10mm_percentile_95.txt"), header = T, sep = ",")
+df_efields$participant <- gsub("sub-", "", df_efields$participant)
+
+df_efields <- df_efields %>% 
+  rename(stim_type = session)
+df_efields$stim_type <- as.factor(df_efields$stim_type)
+df_efields$stim_type <- dplyr::recode(df_efields$stim_type, 
+                               "offline" = "Offline", 
+                               "offline_online" = "Offline + Online")
+
+# Prepare df
+df_reading <- reading_df %>% 
+  filter(stim_type != "Sham") %>% 
+  droplevels() %>% 
+  group_by(participant, stim_type, task) %>% 
+  summarise(mean_RT = mean(RT)) %>% 
+  mutate(task = dplyr::recode(task, "Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "2-back dual"))
+
+df_reading <- full_join(df_reading, df_efields, relationship = "many-to-many")
+
+# Correlation for offline AG session ----
+cor_results_reading_offline <- df_reading %>%
+  filter(stim_type == "Offline" & participant != "07") %>%
+  droplevels() %>%
+  group_by(task) %>%
+  group_modify(~ {
+    cor1 <- broom::tidy(cor.test(.x$mean_field, .x$mean_RT))
+    tibble(
+      estimate_RT = cor1$estimate,
+      p.value_RT = cor1$p.value
+    )
+  })
+
+# Correlation for offline AG during offline+online session ----
+cor_results_reading_offline_online_AG <- df_reading %>%
+  filter(stim_type == "Offline + Online" & roi == "AG") %>%
+  droplevels() %>%
+  group_by(task) %>%
+  group_modify(~ {
+    cor1 <- broom::tidy(cor.test(.x$mean_field, .x$mean_RT))
+    tibble(
+      estimate_RT = cor1$estimate,
+      p.value_RT = cor1$p.value,
+    )
+  })
+
+# Correlation for online DLPFC during offline+online session ----
+cor_results_reading_offline_online_DLPFC <- df_reading %>%
+  filter(stim_type == "Offline + Online" & roi == "DLPFC") %>%
+  droplevels() %>%
+  group_by(task) %>%
+  group_modify(~ {
+    cor1 <- broom::tidy(cor.test(.x$mean_field, .x$mean_RT))
+    tibble(
+      estimate_RT = cor1$estimate,
+      p.value_RT = cor1$p.value,
+    )
+  })
+
+# Check separately for trials with and without trigger during offline+online session ----
+df_reading <- reading_df %>% 
+  filter(stim_type != "Sham") %>% 
+  droplevels() %>% 
+  group_by(participant, stim_type, task, is_trigger) %>% 
+  summarise(mean_RT = mean(RT)) %>% 
+  mutate(task = dplyr::recode(task, "Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "2-back dual"))
+
+df_reading <- full_join(df_reading, df_efields, relationship = "many-to-many")
+
+# Correlation for online DLPFC during offline+online session ----
+cor_results_reading_offline_online_DLPFC_trigger <- df_reading %>%
+  filter(stim_type == "Offline + Online" & roi == "DLPFC") %>%
+  droplevels() %>%
+  group_by(task, is_trigger) %>%
+  group_modify(~ {
+    cor1 <- broom::tidy(cor.test(.x$mean_field, .x$mean_RT))
+    tibble(
+      estimate_RT = cor1$estimate,
+      p.value_RT = cor1$p.value,
+    )
+  }) %>%
+  mutate(p_FDR_RT = p.adjust(p.value_RT, method = "fdr"))
+
+df_DLPFC_offline_online <- df_reading %>%
+  filter(
+    stim_type == "Offline + Online",
+    roi == "DLPFC",
+  ) %>%
+  droplevels()
+
+ann_RT <- cor_results_reading_offline_online_DLPFC_trigger %>%
+  transmute(
+    task,
+    is_trigger,
+    label = sprintf("r = %.2f\np = %.3f", estimate_RT, p.value_RT),
+    # choose a fixed position for annotations (e.g., top-right of each facet)
+    x = max(df_DLPFC_offline_online$mean_field, na.rm = TRUE),
+    y = case_when(is_trigger == "True" ~ 1350,
+                  is_trigger == "False" ~ 1200)
+  )
+
+(reading_RT_DLPFC_efield_trigger <- ggplot(
+  df_DLPFC_offline_online,
+  aes(x = mean_field, y = mean_RT,
+      colour = is_trigger, shape = is_trigger)
+) +
+  geom_point(size = 2) +
+  geom_smooth(data = subset(df_DLPFC_offline_online, is_trigger == "True"), method = "lm", se = FALSE, linewidth = 0.5) +
+  geom_text(
+    data = ann_RT,
+    aes(x = x, y = y, label = label, colour = is_trigger),
+    hjust = 1, vjust = 1, size = 3, show.legend = FALSE
+  ) +
+  facet_wrap(~ task) +
+  labs(
+    x = "Mean E-field (DLPFC)",
+    y = "Reading time",
+    colour = "Trigger",
+    shape  = "Trigger",
+    title  = "Reading: Mean E-field vs RT (DLPFC, Offline + Online)"
+  ) +
+  theme_bw()
+)
+
+ggsave(reading_RT_DLPFC_efield_trigger, file = here("Plots/E-field_Correlations/reading_RT_DLPFC_efield_trigger.png"))
+
+# Linear regression for offline + online session ----
+df_reading_wide <- df_reading %>% 
+  filter(stim_type == "Offline + Online") %>% 
+  droplevels() %>%
+  pivot_wider(names_from = roi, values_from = mean_field)
+
+for(load in unique(df_reading_wide$task)) {
+  dat <- df_reading_wide %>% filter(task == load)
+  assign(
+    paste0("rt_model_", load),
+    lm(mean_RT ~ AG + DLPFC * is_trigger, data = dat)
+  )
+}
+
+summary(rt_model_Reading)
+summary(`rt_model_2-back dual`)
+```
+
+### Moderating role of e-fields
+```{r}
+# AG ----
+reading_df_No_sham <- subset(reading_df, stim_type != "Sham")
+reading_df_No_sham <- droplevels(reading_df_No_sham)
+
+c <- contr.treatment(2) 
+my.coding <- matrix(rep(1/2, 2), ncol = 1) 
+my.simple <- c-my.coding
+contrasts(reading_df_No_sham$task) <- my.simple
+contrasts(reading_df_No_sham$stim_type) <- my.simple
+
+lmm_reading_Efield_AG <- lmerTest::lmer(
+  log(RT) ~ task * scale(efield_AG, scale = TRUE) +
+    (1 + task | participant),
+  data = reading_df_No_sham,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa")
+)
+
+summary(lmm_reading_Efield_AG)
+anova(lmm_reading_Efield_AG)
+
+plot(predict_response(lmm_reading_Efield_AG, c("efield_AG")))
+
+emtrends(lmm_reading_Efield_AG, pairwise ~ task, var = "efield_AG", type = "response")
+
+## Plot ----
+pred_reading_efield_AG <- predict_response(lmm_reading_Efield_AG, c("efield_AG", "task"), margin = "marginalmeans")
+#pred_reading_efield_AG$stim_task <- interaction(pred_reading_efield_AG$group, pred_reading_efield_AG$facet, drop = TRUE)
+pred_reading_efield_AG <- pred_reading_efield_AG %>% 
+  as.data.frame() %>% 
+  rename(task = group)
+
+participant_points <- collapse_by_group(pred_reading_efield_AG, lmm_reading_Efield_AG, "participant")
+#participant_points$stim_task <- interaction(participant_points$stim_type, participant_points$task)
+
+(RT_reading_efield_AG <- ggplot(pred_reading_efield_AG, aes(x = x, y = predicted, color = task, fill = task)) +
+  geom_jitter2(participant_points, mapping = aes(x = efield_AG, y = RT, color = task), inherit.aes = FALSE, alpha = 0.35, size = 2.2, position = position_jitter(width = 1)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = .7) +
+  #facet_wrap(~ task, labeller = labeller(task = c("Reading" = "Reading", "2-back dual" = "Dual task")), scales = "free_x") +
+  ylab("Predicted reading time in ms") +
+  xlab("E-field AG in V/m") +
+  #scale_y_continuous(limits = c(400, 1290)) +
+  scale_x_continuous(breaks = c(50,80,110)) +
+  coord_cartesian(ylim = c(230, 1530)) +
+  #scale_color_manual(values = cols_reading) +
+  #scale_fill_manual(values = cols_reading) +
+  scale_color_manual(values = cols_reading[c(2,5)]) +
+  scale_fill_manual(values = cols_reading[c(2,5)]) +
+  theme_bw(base_size = 8)+
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 9),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8),
+       #axis.title.x = element_text(size = 10),
+       axis.text.x = element_text(size = 8))
+)
+ggsave(RT_reading_efield_AG, file = here(paste0("Plots/RT_reading_efield_AG_", today, ".pdf")), width = 40, height = 45, units = "mm")
+
+# DLPFC ----
+reading_df_No_sham_offline_online <- subset(reading_df, stim_type == "Offline + Online")
+reading_df_No_sham_offline_online <- droplevels(reading_df_No_sham_offline_online)
+
+c <- contr.treatment(2) 
+my.coding <- matrix(rep(1/2, 2), ncol = 1) 
+my.simple <- c-my.coding
+contrasts(reading_df_No_sham_offline_online$task) <- my.simple
+contrasts(reading_df_No_sham_offline_online$is_trigger) <- my.simple
+
+lmm_reading_Efield_DLPFC <- lmerTest::lmer(log(RT) ~ 
+    task +
+    scale(efield_DLPFC, scale = FALSE) + 
+    is_trigger +
+    task : scale(efield_DLPFC, scale = FALSE) + 
+    task : is_trigger +
+    scale(efield_DLPFC, scale = FALSE) : is_trigger +
+    task : scale(efield_DLPFC, scale = FALSE) : is_trigger +
+    (1 + task | participant),
+  data = reading_df_No_sham_offline_online,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa"))
+
+summary(lmm_reading_Efield_DLPFC)
+anova(lmm_reading_Efield_DLPFC)
+
+## Plot ----
+pred_reading_efield_DLPFC <- predict_response(lmm_reading_Efield_DLPFC, c("efield_DLPFC", "is_trigger"), margin = "marginalmeans")
+
+(RT_reading_efield_DLPFC <- plot(pred_reading_efield_DLPFC, collapse_group = TRUE) +
+  ylab("Predicted reading time in ms") +
+  xlab("E-field DLPFC in V/m") +
+  scale_x_continuous(breaks = extended_breaks(3)) +
+  #coord_cartesian(ylim = c(230, 1530)) +
+  scale_color_manual(values = cols_dualContrast) +
+  scale_fill_manual(values = cols_dualContrast) +
+  theme_bw(base_size = 8)+
+  theme(legend.position = "bottom",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       plot.title = element_blank(),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8),
+       #axis.title.x = element_text(size = 9),
+       axis.text.x = element_text(size = 8))
+)
+ggsave(RT_reading_efield_DLPFC, file = here(paste0("Plots/RT_reading_efield_DLPFC.pdf")), width = 60, height = 45, units = "mm")
+
+tab_model(lmm_reading_Efield_AG,
+          lmm_reading_Efield_DLPFC,
+  show.intercept = FALSE,
+  show.icc = TRUE,   # ICC (Intraclass Correlation) is not always needed
+  show.re.var = TRUE,  # Show variance of random effects
+  show.df = FALSE,     # Don't display degrees of freedom
+  show.obs = FALSE,    # Don't display number of observations
+  show.ngroups = FALSE, # Don't display number of groups for random effects
+  show.stat = TRUE,    # Show model statistics (e.g., p-values, F-values)
+  collapse.ci = TRUE,  # Collapse confidence intervals into one line
+  dv.labels = c("E-field AG", "E-field DLPFC"),
+  file = here("Model_tables/reading_efields.doc")
+)
+
+(plot_RT_reading_efield <- ggarrange(RT_reading_efield_AG,
+                                    RT_reading_efield_DLPFC,
+                                    nrow = 1,
+                                    widths = c(1, 0.8)))
+ggsave(plot_RT_reading_efield, file = here(paste0("Plots/plot_RT_reading_efield.pdf")), width = 90, height = 70, units = "mm")
+```
+
+
+## DELTAS
+### Classify TMS reaction
+```{r}
+# Prepare df
+reading_df <- subset(reading_df, !is.na(surprisal_2))
+reading_df <- subset(reading_df, surprisal_2 < 40)
+reading_df <- reading_df %>% 
+  mutate(task = dplyr::recode(task, "Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "2-back dual"))
+
+df_reading <- reading_df %>% 
+  group_by(participant, stim_type, task) %>% 
+  summarise(mean_RT = mean(RT))
+
+df_reading_deltas <- df_reading %>% 
+  pivot_wider(
+    id_cols  = c(participant, task),
+    names_from  = stim_type,
+    values_from = mean_RT
+  ) %>% 
+  mutate(
+    delta_RT_Offline = Offline - Sham,
+    delta_RT_Offline_Online = `Offline + Online` - Sham
+  ) %>% 
+  select(participant, task, delta_RT_Offline, delta_RT_Offline_Online) %>% 
+  pivot_longer(
+    cols = starts_with("delta_"),
+    names_to = c(".value", "stim_type"),
+    names_pattern = "(delta_(?:RT))_(.*)") %>% 
+  mutate(stim_type = dplyr::recode(stim_type,
+      "Offline"          = "Offline",
+      "Offline_Online"   = "Offline + Online"),
+    direction_RT = case_when(
+        delta_RT < 0 ~ "Faster",
+        delta_RT > 0 ~ "Slower",
+        is.na(delta_RT) ~ NA,
+        TRUE ~ "No change"),
+    direction_RT = factor(direction_RT, levels = c("Faster", "No change", "Slower")),
+    task = dplyr::recode(task, "Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "2-back dual"))
+
+# run LMMs on data
+m1 <- lmer(delta_RT ~ task * stim_type + (1+task+stim_type|participant), data = df_reading_deltas)
+summary(m1)
+
+# Plots ----
+# scatter plot
+(reading_change_RT <- ggplot(df_reading_deltas[!is.na(df_reading_deltas$delta_RT),], aes(x = task, y = delta_RT, colour = direction_RT, label = participant, group = participant)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_point(position = position_dodge(width = 0.2), size = 1.3) +
+  #geom_line(position = position_dodge(width = 0.2), alpha = 0.5) +
+  geom_text_repel(size = 1.5, position = position_dodge(width = 0.2), show.legend = FALSE, max.overlaps = 60) +
+  facet_wrap(~ stim_type, nrow = 1) +
+  scale_fill_manual(values = cols_reading) +
+  scale_color_manual(values = cols_reading) +
+  labs(x = "Task", y = "Δ RT (TMS – Sham)", colour = "RT direction", title = "RT changes per participant and task") +
+  theme_bw(base_size = 9.5) +
+  theme(legend.position = "bottom",
+     text = element_text(family = "Helvetica"),
+     panel.grid.major = element_blank(),
+     panel.grid.minor = element_blank(),
+     strip.background = element_blank(),
+     strip.text = element_text(size = 10),
+     axis.line = element_line(),
+     axis.text.y = element_text(size = 8.5),
+     axis.title.x = element_blank(),
+     axis.text.x = element_text(size = 8.5))
+)
+ggsave(reading_change_RT, file = here("Plots/reading_delta_RT_scatter.png"), width = 100, height = 80, units = "mm")
+
+# donut plot
+df_RT_donut <- df_reading_deltas %>% 
+  filter(!is.na(delta_RT)) %>% 
+  group_by(task, stim_type, direction_RT) %>% 
+  summarise(n = n(), .groups = "drop_last") %>% 
+  mutate(
+    prop = n / sum(n),
+    ymax = cumsum(prop),
+    ymin = dplyr::lag(ymax, default = 0),
+    label_pos = (ymax + ymin) / 2
+  )
+
+(reading_donut_RT <- ggplot(df_RT_donut, aes(ymax = ymax, ymin = ymin, xmax = 4, xmin = 3, fill = direction_RT)) +
+  geom_rect() +
+  coord_polar(theta = "y") +
+  xlim(c(2, 4)) +
+  facet_wrap(~ stim_type + task, labeller = labeller(task = as_labeller(c("Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "2-back dual"))), nrow = 1) +
+  geom_text(aes(y = label_pos,x = 3.5, label = percent(prop, accuracy = 1)), colour = "black", size = 2) +
+  scale_fill_manual(values = cols_reading) +
+  scale_color_manual(values = cols_reading) +
+  theme_void(base_size = 9.5) +
+  theme(legend.position = "none",
+        aspect.ratio = 1,
+        text = element_text(family = "Helvetica"),)
+)
+ggsave(reading_donut_RT, file = here("Plots/reading_donut_RT.png"), width = 100, height = 80, units = "mm")
+
+reading_delta_RT <- ggarrange(reading_change_RT,
+                            reading_donut_RT,
+                            nrow = 1,
+                            heights = c(0.9, 2.3))
+
+ggsave(reading_delta_RT, file = here("Plots/reading_delta_RT.png"), width = 130, height = 140, units = "mm")
+```
+
+### Correlate reaction with e-fields
+Do people with a stronger reaction (either faster or slower) also have a stronger e-field?
+```{r}
+# Read in file with e-fields (95 percentile from 10 mm ROI around stim coordinates) and prepare df
+df_efields = read.table(here::here("average_efields_sphere_10mm_percentile_95.txt"), header = T, sep = ",")
+df_efields$participant <- gsub("sub-", "", df_efields$participant)
+
+df_efields <- df_efields %>% 
+  rename(stim_type = session)
+df_efields$stim_type <- as.factor(df_efields$stim_type)
+df_efields$stim_type <- dplyr::recode(df_efields$stim_type, 
+                               "offline" = "Offline", 
+                               "offline_online" = "Offline + Online")
+
+df_reading_deltas_efields <- full_join(df_reading_deltas, df_efields, relationship = "many-to-many")
+
+# Correlation for offline AG session ----
+cor_results_reading_offline_delta_direction <- df_reading_deltas_efields %>%
+  filter(stim_type == "Offline" & participant != "07") %>% #& direction_dprime != "No change"
+  droplevels() %>%
+  group_by(task, direction_RT) %>%
+  group_modify(~ {
+    cor1 <- broom::tidy(cor.test(.x$mean_field, .x$delta_RT))
+    tibble(
+      estimate_RT = cor1$estimate,
+      p.value_RT = cor1$p.value,
+    )
+  }) %>%
+  mutate(p_FDR_RT = p.adjust(p.value_RT, method = "fdr"))
+
+# Correlation for offline AG during offline+online session ----
+cor_results_reading_offline_online_AG_delta_direction <- df_reading_deltas_efields %>%
+  filter(stim_type == "Offline + Online" & roi == "AG" & !is.na(direction_RT)) %>%
+  droplevels() %>%
+  group_by(task, direction_RT) %>%
+  group_modify(~ {
+    cor1 <- broom::tidy(cor.test(.x$mean_field, .x$delta_RT))
+    tibble(
+      estimate_RT = cor1$estimate,
+      p.value_RT = cor1$p.value,
+    )
+  }) %>%
+  ungroup %>% 
+  mutate(p_FDR_RT = p.adjust(p.value_RT, method = "fdr"))
+
+# plot result for RT
+df_ag_offline_online <- df_reading_deltas_efields %>%
+  filter(
+    stim_type == "Offline + Online",
+    roi == "AG",
+    !is.na(direction_RT)
+  ) %>%
+  droplevels()
+
+ann_RT <- cor_results_reading_offline_online_AG_delta_direction %>%
+  transmute(
+    task,
+    direction_RT,
+    label = sprintf("r = %.2f\np = %.3f", estimate_RT, p.value_RT),
+    x = max(df_ag_offline_online$mean_field, na.rm = TRUE),
+    y = case_when(
+      direction_RT == "Slower" ~ 390,
+      direction_RT == "Faster" ~ 300
+    ))
+
+(reading_RT_AG_efield_direction <- ggplot(
+  df_ag_offline_online,
+  aes(x = mean_field, y = delta_RT, colour = direction_RT, shape = direction_RT)) +
+  geom_point(size = 2) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.5) +
+  geom_text(
+    data = ann_RT,
+    aes(x = x, y = y, label = label, colour = direction_RT),
+    hjust = 1, vjust = 1, size = 3, show.legend = FALSE
+  ) +
+  facet_wrap(~ task) +
+  labs(
+    x = "Mean E-field (AG)",
+    y = "Δ RT (TMS – Sham)",
+    colour = "RT direction",
+    shape  = "RT direction",
+    title  = "Mean E-field vs RT delta (AG, Offline + Online)"
+  ) +
+  theme_bw()
+)
+
+ggsave(reading_RT_AG_efield_direction, file = here("Plots/E-field_Correlations/reading_RT_AG_efield_direction.png"))
+
+# Correlation for online DLPFC during offline+online session ----
+cor_results_reading_offline_online_DLPFC_delta_direction <- df_reading_deltas_efields %>%
+  filter(stim_type == "Offline + Online" & roi == "DLPFC" & !is.na(direction_RT)) %>%
+  droplevels() %>%
+  group_by(task, direction_RT) %>%
+  group_modify(~ {
+    cor1 <- broom::tidy(cor.test(.x$mean_field, .x$delta_RT))
+    tibble(
+      estimate_RT = cor1$estimate,
+      p.value_RT = cor1$p.value,
+    )
+  }) %>% 
+  ungroup() %>% 
+  mutate(p_FDR_RT = p.adjust(p.value_RT, method = "fdr"))
+```
+
+### Correlations with raw delta values
+```{r efields prepare df}
+# Read in file with e-fields (95 percentile from 10 mm ROI around stim coordinates) and prepare df
+df_efields = read.table(here::here("average_efields_sphere_10mm_percentile_95.txt"), header = T, sep = ",")
+df_efields$participant <- gsub("sub-", "", df_efields$participant)
+
+df_efields <- df_efields %>% 
+  rename(stim_type = session)
+df_efields$stim_type <- as.factor(df_efields$stim_type)
+df_efields$stim_type <- dplyr::recode(df_efields$stim_type, 
+                               "offline" = "Offline", 
+                               "offline_online" = "Offline + Online")
+
+# Prepare df
+df_reading <- reading_df %>% 
+  group_by(participant, stim_type, task) %>% 
+  summarise(mean_RT = mean(RT))
+
+df_reading_deltas <- df_reading %>% 
+  pivot_wider(
+    id_cols  = c(participant, task),
+    names_from  = stim_type,
+    values_from = mean_RT
+  ) %>% 
+  mutate(
+    delta_RT_Offline = Offline - Sham,
+    delta_RT_Offline_Online = `Offline + Online` - Sham
+  ) %>% 
+  select(participant, task, delta_RT_Offline, delta_RT_Offline_Online) %>% 
+  pivot_longer(
+    cols = starts_with("delta_"),
+    names_to = c(".value", "stim_type"),
+    names_pattern = "(delta_(?:RT))_(.*)") %>% 
+  mutate(stim_type = dplyr::recode(stim_type,
+      "Offline"          = "Offline",
+      "Offline_Online"   = "Offline + Online"),
+      task = dplyr::recode(task, "Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "2-back dual"))
+
+df_reading_deltas <- full_join(df_reading_deltas, df_efields, relationship = "many-to-many")
+
+# Correlation for offline AG session ----
+cor_results_reading_delta_offline <- df_reading_deltas %>%
+  filter(stim_type == "Offline" & participant != "07") %>%
+  droplevels() %>%
+  group_by(task) %>%
+  group_modify(~ {
+    cor1 <- broom::tidy(cor.test(.x$mean_field, .x$delta_RT))
+    tibble(
+      estimate_RT = cor1$estimate,
+      p.value_RT = cor1$p.value,
+    )
+  }) %>%
+  mutate(p_FDR_RT = p.adjust(p.value_RT, method = "fdr"))
+
+# Correlation for offline AG during offline+online session ----
+cor_results_reading_delta_offline_online_AG <- df_reading_deltas %>%
+  filter(stim_type == "Offline + Online" & roi == "AG") %>%
+  droplevels() %>%
+  group_by(task) %>%
+  group_modify(~ {
+    cor1 <- broom::tidy(cor.test(.x$mean_field, .x$delta_RT))
+    tibble(
+      estimate_RT = cor1$estimate,
+      p.value_RT = cor1$p.value,
+    )
+  }) %>%
+  mutate(p_FDR_RT = p.adjust(p.value_RT, method = "fdr"))
+
+# Correlation for online DLPFC during offline+online session ----
+cor_results_reading_delta_offline_online_DLPFC <- df_reading_deltas %>%
+  filter(stim_type == "Offline + Online" & roi == "DLPFC") %>%
+  droplevels() %>%
+  group_by(task) %>%
+  group_modify(~ {
+    cor1 <- broom::tidy(cor.test(.x$mean_field, .x$delta_RT))
+    tibble(
+      estimate_RT = cor1$estimate,
+      p.value_RT = cor1$p.value,
+    )
+  }) %>%
+  mutate(p_FDR_RT = p.adjust(p.value_RT, method = "fdr"))
+
+# Linear regression for offline + online session ----
+df_reading_deltas_wide <- df_reading_deltas %>% 
+  filter(stim_type == "Offline + Online") %>% 
+  droplevels() %>%
+  pivot_wider(names_from = roi, values_from = mean_field)
+
+for(load in unique(df_reading_deltas_wide$task)) {
+  dat <- df_reading_deltas_wide %>% filter(task == load)
+  assign(
+    paste0("rt_model_", load),
+    lm(delta_RT ~ AG + DLPFC, data = dat)
+  )
+}
+
+summary(rt_model_Reading)
+summary(`rt_model_2-back dual`)
+
+# Check for effect of is_trigger ----
+df_reading <- reading_df %>% 
+  group_by(participant, stim_type, task, is_trigger) %>% 
+  summarise(mean_RT = mean(RT))
+
+df_reading_deltas <- df_reading %>% 
+  filter(stim_type != "Offline") %>% 
+  pivot_wider(
+    id_cols  = c(participant, task, is_trigger),
+    names_from  = stim_type,
+    values_from = mean_RT
+  ) %>% 
+  mutate(
+    delta_RT_Offline_Online = `Offline + Online` - Sham
+  ) %>% 
+  select(participant, task, is_trigger, delta_RT_Offline_Online) %>% 
+  pivot_longer(
+    cols = starts_with("delta_"),
+    names_to = c(".value", "stim_type"),
+    names_pattern = "(delta_(?:RT))_(.*)") %>% 
+  mutate(stim_type = dplyr::recode(stim_type,
+      "Offline_Online"   = "Offline + Online"),
+       task = dplyr::recode(task, "Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "2-back dual"))
+
+df_reading_deltas <- full_join(df_reading_deltas, df_efields, relationship = "many-to-many")
+
+# Correlation for online DLPFC during offline+online session ----
+cor_results_reading_offline_online_DLPFC_trigger <- df_reading_deltas %>%
+  filter(stim_type == "Offline + Online" & roi == "DLPFC" & !is.na(delta_RT)) %>%
+  droplevels() %>%
+  group_by(task, is_trigger) %>%
+  group_modify(~ {
+    cor1 <- broom::tidy(cor.test(.x$mean_field, .x$delta_RT))
+    tibble(
+      estimate_RT = cor1$estimate,
+      p.value_RT = cor1$p.value,
+    )
+  }) %>%
+  mutate(p_FDR_RT = p.adjust(p.value_RT, method = "fdr"))
+```
+
+### Correlate delta in reading time with accuracy
+```{r}
+reading_df_wide <- reading_df %>%
+  group_by(participant, stim_type, task) %>% 
+  mutate(mean_RT = mean(RT, rm.na = TRUE), mean_acc = mean(question_acc)) %>% 
+  select(participant, task, stim_type, mean_RT, mean_acc) %>% 
+  distinct() %>% 
+  pivot_wider(
+    names_from = stim_type,
+    values_from = c(mean_RT, mean_acc)
+  )
+
+reading_df_wide <- reading_df_wide %>%
+  mutate(
+    delta_RT_offline_sham        = mean_RT_Offline - mean_RT_Sham,
+    delta_RT_offline_online_sham = `mean_RT_Offline + Online` - mean_RT_Sham,
+    delta_acc_offline_sham        = mean_acc_Offline - mean_acc_Sham,
+    delta_acc_offline_online_sham = `mean_acc_Offline + Online` - mean_acc_Sham
+  ) %>% 
+  rename(mean_RT_Offline_Online  = `mean_RT_Offline + Online`,
+    mean_acc_Offline_Online = `mean_acc_Offline + Online`)
+
+cor.test(reading_df_wide$delta_RT_offline_sham, reading_df_wide$delta_acc_offline_sham)
+cor.test(reading_df_wide$delta_RT_offline_online_sham, reading_df_wide$delta_acc_offline_online_sham)
+
+reading_df_wide %>% ggscatter(x = "delta_RT_offline_online_sham", y = "delta_acc_offline_online_sham", facet.by = "task", add = "reg.line", conf.int = T, cor.coef = T, size = 1, alpha = 1)
+
+reading_df_wide %>% ggscatter(x = "delta_RT_offline_sham", y = "delta_acc_offline_sham", facet.by = "task", add = "reg.line", conf.int = T, cor.coef = T, size = 1, alpha = 1) #label = "participant"
+
+# Explore effect of trigger (only offline+online and sham sessions) ----
+reading_df_wide <- reading_df %>%
+  filter(stim_type != "Offline") %>% 
+  group_by(participant, stim_type, task, is_trigger) %>% 
+  mutate(mean_RT = mean(RT, rm.na = TRUE), mean_acc = mean(question_acc)) %>% 
+  select(participant, task, stim_type, mean_RT, mean_acc, is_trigger) %>% 
+  distinct() %>% 
+  pivot_wider(
+    names_from = stim_type,
+    values_from = c(mean_RT, mean_acc)
+  )
+
+
+reading_df_wide <- reading_df_wide %>%
+  mutate(
+    delta_RT_offline_online_sham = `mean_RT_Offline + Online` - mean_RT_Sham,
+    delta_acc_offline_online_sham = `mean_acc_Offline + Online` - mean_acc_Sham
+  ) %>% 
+  rename(mean_RT_Offline_Online  = `mean_RT_Offline + Online`,
+    mean_acc_Offline_Online = `mean_acc_Offline + Online`) %>% 
+  mutate(task = dplyr::recode(task, "Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "2-back dual"))
+
+corr_Acc_RT_reading_offline_online <- reading_df_wide %>% ggscatter(x = "delta_RT_offline_online_sham", y = "delta_acc_offline_online_sham", facet.by = c("task", "is_trigger"), add = "reg.line", conf.int = T, cor.coef = T, size = 1, alpha = 1)
+
+ggsave(corr_Acc_RT_reading_offline_online, file = here("Plots/corr_Acc_RT_reading_offline_online.png"), width = 110, height = 100, units = "mm")
+```
+
+## EFFECT OF BASELINE PERFORMANCE
+How much is reaction to TMS moderated by baseline performance during sham?
+```{r}
+# RT ----
+reading_df <- subset(reading_df, !is.na(surprisal_2))
+reading_df <- subset(reading_df, surprisal_2 < 40)
+reading_df <- reading_df %>% 
+  mutate(task = dplyr::recode(task, "Reading_Baseline_main_click" = "Reading", "2back_dual_main_click" = "2-back dual"))
+
+sham_baseline <- reading_df %>% 
+  filter(stim_type == "Sham") %>% 
+  group_by(participant, task) %>% 
+  summarise(sham_RT = median(log(RT), na.rm = TRUE))
+
+reading_df <- reading_df %>% 
+  left_join(sham_baseline) %>%
+  filter(stim_type != "Sham") %>% 
+  group_by(task) %>% 
+  mutate(sham_RT_centered = sham_RT - mean(sham_RT))
+
+lmm_reading_shamBaseline <- lmerTest::lmer(log(RT) ~
+          stim_type +
+          task +
+          scale(sham_RT, scale = FALSE) + 
+          stim_type:task +
+          stim_type:scale(sham_RT, scale = FALSE) +
+          stim_type:task:scale(sham_RT, scale = FALSE) +
+          (1 + stim_type + task | participant),
+        data = reading_df,
+        REML = FALSE,
+        control = lmerControl(optimizer = "bobyqa"))
+
+summary(lmm_reading_shamBaseline)
+anova(lmm_reading_shamBaseline)
+
+plot(predict_response(lmm_reading_shamBaseline, c("sham_RT", "stim_type", "task"), margin = "marginalmeans"), limit_range = TRUE)
+
+slopes_stimType_task <- emtrends(
+  lmm_reading_shamBaseline,
+  specs = ~ stim_type | task,
+  var = "sham_RT",
+  type = "response"
+)
+
+summary(slopes_stimType_task)
+pairs(slopes_stimType_task, adjust = "holm")
+
+# Plot ----
+pred_reading_shamBaseline <- predictions(
+  lmm_reading_shamBaseline,
+  #newdata = reading_grid_surprisal,
+  by = c("sham_RT", "stim_type", "task"),
+  type = "response",
+  transform = exp,
+  re.form = NA
+)
+
+# for plotting
+pred_reading_shamBaseline$stim_task <- interaction(pred_reading_shamBaseline$stim_type, pred_reading_shamBaseline$task, drop = TRUE)
+participant_points <- collapse_by_group(pred_reading_shamBaseline, lmm_reading_shamBaseline, "participant")
+participant_points$stim_task <- interaction(participant_points$stim_type, participant_points$task)
+
+(RT_reading_shamBaseline_lmm <- ggplot(subset(pred_reading_shamBaseline, stim_type != "Sham"), aes(x = exp(sham_RT), y = estimate, colour = stim_task, fill = stim_task)) +
+  geom_jitter2(subset(participant_points, stim_type != "Sham"), mapping = aes(x = exp(sham_RT), y = RT, color = stim_task), inherit.aes = FALSE, alpha = 0.35, size = 2.2, position = position_jitter(width = 1)) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = .7) +
+  facet_wrap(~ task, labeller = labeller(task = c("Reading" = "Reading", "2-back dual" = "Dual task")), scales = "free_x") +
+  ylab("Predicted reading time in ms") +
+  xlab("Baseline reading time in ms") +
+  scale_y_continuous(breaks = pretty_breaks(3)) +
+  scale_x_continuous(breaks = extended_breaks(n = 3)) +
+  coord_cartesian(ylim = c(230, 1530)) +
+  scale_color_manual(values = cols_reading[c(2,3,5,6)]) +
+  scale_fill_manual(values = cols_reading[c(2,3,5,6)]) +
+  theme_bw(base_size = 8)+
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 9),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8),
+       #axis.title.x = element_text(size = 10),
+       axis.text.x = element_text(size = 8))
+)
+ggsave(RT_reading_shamBaseline_lmm, file = here(paste0("Plots/RT_reading_shamBaseline_lmm_", today, ".pdf")), width = 50, height = 85, units = "mm")
+
+# Plot change in ratio/% for low, average, and high performers ----
+base_vals <- reading_df %>%
+  group_by(task) %>%
+  reframe(
+    sham_RT = c(
+      quantile(sham_RT, .25, na.rm = TRUE),
+      mean(sham_RT, na.rm = TRUE),
+      quantile(sham_RT, .75, na.rm = TRUE)
+    ),
+    base_label = c("Fast", "Average", "Slow"),
+    .groups = "drop"
+  )
+newdat <- tidyr::crossing(
+  base_vals,
+  stim_type = levels(reading_df$stim_type)
+)
+
+cmp_all <- comparisons(
+  lmm_reading_shamBaseline,
+  newdata = newdat,
+  variables = list(stim_type = "reference"),
+  transform = exp,
+  re.form = NA,
+  comparison = "difference"
+)
+
+cmp_all$stim_task <- interaction(cmp_all$contrast, cmp_all$task)
+cmp_all$base_label <- factor(cmp_all$base_label, levels = c("Slow", "Average", "Fast"))
+
+(RT_reading_shamBaseline_comparisons <- ggplot(cmp_all, aes(y = (estimate-1)*100, x = base_label, group = contrast)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey45") +
+  geom_line(linewidth = 0.65, aes(colour = stim_task)) +
+  geom_point(size = 3, aes(colour = stim_task, fill = stim_task), shape = 23) +
+  geom_errorbar(aes(ymin = (conf.low-1)*100, ymax = (conf.high-1)*100, colour = stim_task), width = 0.15, linewidth = 1) +
+  #scale_x_continuous(breaks = base_vals$sham_RT, labels = base_vals$base_label) +
+  #scale_x_reverse() +
+  facet_grid(contrast ~ task, scales = "free", labeller = labeller(task = c("Reading" = "Reading", "2-back dual" = "Dual task"))) +
+  scale_color_manual(values = cols_reading[c(2,3,5,6)]) +
+  scale_fill_manual(values = cols_reading[c(2,3,5,6)]) +
+  ylab("% change in reading time vs Sham") +
+  xlab("Baseline performance") +
+  theme_bw(base_size = 8)+
+  theme(legend.position = "none",
+       text = element_text(family = "Helvetica"),
+       panel.grid.major = element_blank(),
+       panel.grid.minor = element_blank(),
+       strip.background = element_blank(),
+       strip.text = element_text(size = 9),
+       axis.line = element_line(),
+       axis.text.y = element_text(size = 8),
+       #axis.title.x = element_text(size = 10),
+       axis.text.x = element_text(size = 8, angle = 45, hjust = 1, vjust = 1))
+)
+ggsave(RT_reading_shamBaseline_comparisons, file = here(paste0("Plots/RT_reading_shamBaseline_comparisons_", today, ".pdf")), width = 60, height = 85, units = "mm")
+```
+
+## Correlation of different psycholinguistic predictors
+```{r}
+df_psycholing <- reading_df |> 
+  select(trial_nr, text_nr, word_length_single, zipf_frequency, surprisal_2, entropy_2, previous_surprisal_2) |> 
+  distinct()
+df_psycholing <- lapply(df_psycholing, as.numeric)
+df_psycholing <- as.data.frame(df_psycholing)
+
+# Calculate correlation matrix
+cor_mat <- cor(df_psycholing[, 3:7])
+p_mat <- matrix(NA, ncol = ncol(df_psycholing[, 3:7]), nrow = ncol(df_psycholing[, 3:7]))
+colnames(p_mat) <- rownames(p_mat) <- colnames(df_psycholing[, 3:7])
+
+for (i in 1:ncol(df_psycholing[, 3:7])) {
+  for (j in 1:ncol(df_psycholing[, 3:7])) {
+    p_mat[i, j] <- cor.test(df_psycholing[, 3:7][, i],
+                            df_psycholing[, 3:7][, j])$p.value
+  }
+}
+
+# set diagonales to NA
+diag(cor_mat) <- NA
+diag(p_mat) <- NA
+
+# Long format
+melted_cor <- reshape2::melt(cor_mat, na.rm = T)
+melted_p   <- reshape2::melt(p_mat, na.rm = T)
+
+plot_df <- merge(melted_cor, melted_p, by = c("Var1", "Var2"))
+colnames(plot_df) <- c("Var1", "Var2", "cor", "p")
+
+# Visualize correlation heatmap
+ggplot(plot_df, aes(Var1, Var2, fill = cor)) +
+  geom_tile(color = "white") +
+  geom_tile(data = subset(plot_df, p < 0.05), fill = NA, color = "black", linewidth = .2) +
+  geom_text(aes(label = sprintf("%.2f", cor)), size = 2) +
+  scale_fill_gradient2(high = "#3F132F", low = "#447696", mid = "white") +
+  theme_minimal(base_size = 9)+
+  theme(legend.position = "right",
+     text = element_text(family = "Helvetica"),
+     panel.grid.major = element_blank(),
+     panel.grid.minor = element_blank(),
+     axis.line = element_line(),
+     axis.text.y = element_text(size = 8),
+     axis.title = element_blank(),
+     axis.text.x = element_text(size = 8, angle = 45, vjust = 1, hjust = 1))
+
+```
+
